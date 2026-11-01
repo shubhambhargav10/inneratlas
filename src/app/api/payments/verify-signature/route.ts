@@ -15,7 +15,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const order = db.getOrderById(orderId);
+    const order = await db.getOrderById(orderId);
     if (!order) {
       return NextResponse.json({ error: "Order not found." }, { status: 404 });
     }
@@ -30,13 +30,14 @@ export async function POST(req: NextRequest) {
     }
 
     // Idempotency: If already paid, safely return existing credentials without re-processing
-    if (order.status === "paid" && order.accessToken) {
+    if (order.status === "paid") {
+      const existingReport = await db.getReportByOrderId(order.id);
       return NextResponse.json({
         success: true,
         alreadyProcessed: true,
         orderId: order.id,
         accessToken: order.accessToken,
-        reportCode: order.reportCode,
+        reportCode: existingReport?.reportCode || order.reportCode,
       });
     }
 
@@ -113,13 +114,13 @@ export async function POST(req: NextRequest) {
     }
 
     // Mark as paid and generate official dossier report
-    const { report } = db.markOrderAsPaid(order.id, razorpayPaymentId, razorpaySignature);
+    const { report, accessToken } = await db.markOrderAsPaid(order.id, razorpayPaymentId, razorpaySignature);
 
     return NextResponse.json({
       success: true,
       orderId: order.id,
       reportCode: report.reportCode,
-      accessToken: report.accessToken,
+      accessToken,
     });
   } catch (error: any) {
     console.error("[Payments] Signature verification error:", error);

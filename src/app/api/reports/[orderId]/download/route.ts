@@ -25,7 +25,7 @@ export async function GET(
       });
     }
 
-    const order = db.getOrderById(orderId);
+    const order = await db.getOrderById(orderId);
     if (!order) {
       return new NextResponse("Report not found.", {
         status: 404,
@@ -47,15 +47,9 @@ export async function GET(
       });
     }
 
-    // 3. Cryptographic timing-safe token verification
-    if (!order.accessToken) {
-      return new NextResponse("Unauthorized: Report has not been issued.", { status: 401 });
-    }
-
-    const tokenBuf = Buffer.from(token, "utf-8");
-    const orderTokenBuf = Buffer.from(order.accessToken, "utf-8");
-
-    if (tokenBuf.length !== orderTokenBuf.length || !crypto.timingSafeEqual(tokenBuf, orderTokenBuf)) {
+    // 3. Cryptographic timing-safe token verification against hashed database token
+    const isValidToken = await db.verifyReportToken(orderId, token);
+    if (!isValidToken) {
       return new NextResponse("Unauthorized: Invalid access token.", {
         status: 401,
         headers: {
@@ -66,7 +60,7 @@ export async function GET(
       });
     }
 
-    const report = db.getReportByOrderId(orderId);
+    const report = await db.getReportByOrderId(orderId);
     const assessment = getAssessmentBySlug(order.assessmentSlug);
     const assessmentTitle = assessment ? assessment.title : "Psychometric Assessment";
 
@@ -79,7 +73,7 @@ export async function GET(
     });
 
     if (report) {
-      db.incrementReportDownload(report.id);
+      await db.incrementReportDownload(report.id);
     }
 
     const fileName = `InnerAtlas-Report-${report?.reportCode || order.orderNumber}.pdf`;

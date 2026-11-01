@@ -47,7 +47,7 @@ export async function POST(req: NextRequest) {
     const eventId = event.id || req.headers.get("x-razorpay-event-id");
 
     // 1. Webhook Event Deduplication (Idempotency)
-    if (eventId && db.isWebhookEventProcessed(eventId)) {
+    if (eventId && (await db.isWebhookEventProcessed(eventId))) {
       console.log(`[Webhook] Event ${eventId} was already processed. Skipping duplicate.`);
       return NextResponse.json({ status: "already_processed", eventId });
     }
@@ -61,7 +61,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ status: "ignored_no_order_id" });
     }
 
-    const order = db.getOrderByRazorpayOrderId(rzpOrderId);
+    const order = await db.getOrderByRazorpayOrderId(rzpOrderId);
     if (!order) {
       console.warn(`[Webhook] No corresponding local order found for Razorpay order ${rzpOrderId}`);
       return NextResponse.json({ status: "order_not_found" }, { status: 404 });
@@ -70,8 +70,8 @@ export async function POST(req: NextRequest) {
     // 2. Handle Payment Failure Events
     if (eventType === "payment.failed") {
       console.log(`[Webhook] Payment failed for order ${order.id}.`);
-      db.markOrderAsFailed(order.id);
-      if (eventId) db.recordWebhookEvent(eventId, eventType);
+      await db.markOrderAsFailed(order.id);
+      if (eventId) await db.recordWebhookEvent(eventId, eventType);
       return NextResponse.json({ status: "marked_failed" });
     }
 
@@ -101,13 +101,13 @@ export async function POST(req: NextRequest) {
 
       // Safe idempotent fulfillment
       if (order.status !== "paid") {
-        db.markOrderAsPaid(order.id, paymentId || "pay_webhook_captured", signature);
+        await db.markOrderAsPaid(order.id, paymentId || "pay_webhook_captured", signature);
         console.log(`[Webhook] Order ${order.id} verified and fulfilled successfully via ${eventType}.`);
       }
     }
 
     if (eventId) {
-      db.recordWebhookEvent(eventId, eventType);
+      await db.recordWebhookEvent(eventId, eventType);
     }
 
     return NextResponse.json({ status: "success" });

@@ -1,93 +1,67 @@
-import fs from "fs";
-import path from "path";
-import crypto from "crypto";
+import {
+  DatabaseRepository,
+  SupabasePostgresRepository,
+  InMemoryRepository,
+  hashAccessToken,
+} from "@/lib/supabase/repository";
+import { isSupabaseConfigured } from "@/lib/supabase/config";
+import {
+  OrderRecord,
+  ReportRecord,
+  OrderStatus,
+  AssessmentSessionRecord,
+} from "@/lib/supabase/types";
 import { AssessmentResult } from "@/data/assessments/types";
 
-export interface OrderRecord {
-  id: string;
-  orderNumber: string;
-  sessionId?: string;
-  guestSessionToken: string;
-  assessmentSlug: string;
-  customerName: string;
-  customerEmail: string;
-  amountPaise: number;
-  currency: string;
-  status: "created" | "processing" | "paid" | "failed" | "refunded";
-  razorpayOrderId?: string;
-  razorpayPaymentId?: string;
-  razorpaySignature?: string;
-  resultPayload: AssessmentResult;
-  reportCode?: string;
-  accessToken?: string;
-  createdAt: string;
-  updatedAt: string;
+export type { OrderRecord, ReportRecord, OrderStatus, AssessmentSessionRecord };
+export { hashAccessToken };
+
+let postgresRepoInstance: SupabasePostgresRepository | null = null;
+let inMemoryRepoInstance: InMemoryRepository | null = null;
+let customRepoOverride: DatabaseRepository | null = null;
+
+export function setDatabaseRepositoryOverride(repo: DatabaseRepository | null): void {
+  customRepoOverride = repo;
 }
 
-export interface ReportRecord {
-  id: string;
-  orderId: string;
-  reportCode: string;
-  accessToken: string;
-  customerName: string;
-  customerEmail: string;
-  assessmentSlug: string;
-  resultPayload: AssessmentResult;
-  pageCount: number;
-  generatedAt: string;
-  downloadCount: number;
+export function resetInMemoryRepository(): void {
+  inMemoryRepoInstance = new InMemoryRepository();
 }
 
-interface LocalStoreSchema {
-  orders: Record<string, OrderRecord>;
-  reports: Record<string, ReportRecord>;
-  processedWebhookEvents?: Record<string, { eventId: string; eventType: string; processedAt: string }>;
-  adminLoginAttempts?: Record<string, { attempts: number; lastAttempt: number; lockedUntil?: number }>;
-}
-
-const DATA_DIR = path.join(process.cwd(), ".data");
-const STORE_FILE = path.join(DATA_DIR, "store.json");
-
-function ensureStore(): LocalStoreSchema {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
+function getActiveRepo(): DatabaseRepository {
+  if (customRepoOverride) {
+    return customRepoOverride;
   }
-  if (!fs.existsSync(STORE_FILE)) {
-    const initial: LocalStoreSchema = {
-      orders: {},
-      reports: {},
-      processedWebhookEvents: {},
-      adminLoginAttempts: {},
-    };
-    fs.writeFileSync(STORE_FILE, JSON.stringify(initial, null, 2));
-    return initial;
+
+  const isProduction = process.env.NODE_ENV === "production";
+  const configured = isSupabaseConfigured();
+
+  if (configured) {
+    if (!postgresRepoInstance) {
+      postgresRepoInstance = new SupabasePostgresRepository();
+    }
+    return postgresRepoInstance;
   }
-  try {
-    const content = fs.readFileSync(STORE_FILE, "utf-8");
-    const parsed = JSON.parse(content);
-    if (!parsed.orders) parsed.orders = {};
-    if (!parsed.reports) parsed.reports = {};
-    if (!parsed.processedWebhookEvents) parsed.processedWebhookEvents = {};
-    if (!parsed.adminLoginAttempts) parsed.adminLoginAttempts = {};
-    return parsed;
-  } catch (err) {
-    return {
-      orders: {},
-      reports: {},
-      processedWebhookEvents: {},
-      adminLoginAttempts: {},
-    };
+
+  if (isProduction) {
+    throw new Error(
+      "[FATAL SECURITY ERROR] Supabase PostgreSQL is not configured in production. " +
+      "Production deployment strictly requires valid NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY. " +
+      "Filesystem or in-memory persistence is forbidden in production."
+    );
   }
+
+  if (!inMemoryRepoInstance) {
+    inMemoryRepoInstance = new InMemoryRepository();
+  }
+  return inMemoryRepoInstance;
 }
 
-function saveStore(store: LocalStoreSchema): void {
-  try {
-    fs.writeFileSync(STORE_FILE, JSON.stringify(store, null, 2));
-  } catch (err) {
-    console.error("Failed to write store.json:", err);
-  }
-}
-
+/**
+ * Universal Database Data-Access Interface.
+ * Transparently delegates to Supabase PostgreSQL or isolated test repository.
+ * Enforces production fail-closed security.
+ */
 export const db = {
   createOrder(data: {
     guestSessionToken: string;
@@ -97,198 +71,92 @@ export const db = {
     amountPaise: number;
     resultPayload: AssessmentResult;
     razorpayOrderId?: string;
-  }): OrderRecord {
-    const store = ensureStore();
-    const id = "ord_" + crypto.randomBytes(8).toString("hex");
-    const orderNumber = "INA-" + Math.floor(100000 + Math.random() * 900000);
-    const now = new Date().toISOString();
-
-    const order: OrderRecord = {
-      id,
-      orderNumber,
-      guestSessionToken: data.guestSessionToken,
-      assessmentSlug: data.assessmentSlug,
-      customerName: data.customerName,
-      customerEmail: data.customerEmail,
-      amountPaise: data.amountPaise,
-      currency: "INR",
-      status: "created",
-      razorpayOrderId: data.razorpayOrderId,
-      resultPayload: data.resultPayload,
-      createdAt: now,
-      updatedAt: now,
-    };
-
-    store.orders[id] = order;
-    saveStore(store);
-    return order;
+    sessionId?: string;
+  }): Promise<OrderRecord> {
+    return getActiveRepo().createOrder(data);
   },
 
-  getOrderById(id: string): OrderRecord | null {
-    const store = ensureStore();
-    return store.orders[id] || null;
+  getOrderById(id: string): Promise<OrderRecord | null> {
+    return getActiveRepo().getOrderById(id);
   },
 
-  getOrderByRazorpayOrderId(rzpOrderId: string): OrderRecord | null {
-    const store = ensureStore();
-    return Object.values(store.orders).find((o) => o.razorpayOrderId === rzpOrderId) || null;
+  getOrderByRazorpayOrderId(rzpOrderId: string): Promise<OrderRecord | null> {
+    return getActiveRepo().getOrderByRazorpayOrderId(rzpOrderId);
   },
 
-  getOrdersByEmail(email: string): OrderRecord[] {
-    const store = ensureStore();
-    const normalized = email.toLowerCase().trim();
-    return Object.values(store.orders).filter((o) => o.customerEmail.toLowerCase().trim() === normalized);
+  getAllOrders(): Promise<OrderRecord[]> {
+    return getActiveRepo().getAllOrders();
   },
 
-  getAllOrders(): OrderRecord[] {
-    const store = ensureStore();
-    return Object.values(store.orders).sort(
-      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-    );
-  },
-
-  markOrderAsFailed(orderId: string, reason?: string): OrderRecord {
-    const store = ensureStore();
-    const order = store.orders[orderId];
-    if (!order) {
-      throw new Error(`Order ${orderId} not found`);
-    }
-    order.status = "failed";
-    order.updatedAt = new Date().toISOString();
-    saveStore(store);
-    return order;
+  markOrderAsFailed(orderId: string, reason?: string): Promise<OrderRecord> {
+    return getActiveRepo().markOrderAsFailed(orderId, reason);
   },
 
   markOrderAsPaid(
     orderId: string,
     paymentId: string,
     signature?: string
-  ): { order: OrderRecord; report: ReportRecord } {
-    const store = ensureStore();
-    const order = store.orders[orderId];
-    if (!order) {
-      throw new Error(`Order ${orderId} not found`);
-    }
-
-    const now = new Date().toISOString();
-    order.status = "paid";
-    order.razorpayPaymentId = paymentId;
-    if (signature) order.razorpaySignature = signature;
-    order.updatedAt = now;
-
-    // Generate Report if not exists
-    let report = Object.values(store.reports).find((r) => r.orderId === orderId);
-    if (!report) {
-      const reportId = "rep_" + crypto.randomBytes(8).toString("hex");
-      const reportCode = "DOSSIER-" + Math.floor(100000 + Math.random() * 900000);
-      const accessToken = "acc_" + crypto.randomBytes(16).toString("hex");
-
-      report = {
-        id: reportId,
-        orderId: order.id,
-        reportCode,
-        accessToken,
-        customerName: order.customerName,
-        customerEmail: order.customerEmail,
-        assessmentSlug: order.assessmentSlug,
-        resultPayload: order.resultPayload,
-        pageCount: 12,
-        generatedAt: now,
-        downloadCount: 0,
-      };
-
-      store.reports[reportId] = report;
-      order.reportCode = reportCode;
-      order.accessToken = accessToken;
-    }
-
-    saveStore(store);
-    return { order, report };
+  ): Promise<{ order: OrderRecord; report: ReportRecord; accessToken: string }> {
+    return getActiveRepo().markOrderAsPaid(orderId, paymentId, signature);
   },
 
-  getReportByOrderId(orderId: string): ReportRecord | null {
-    const store = ensureStore();
-    return Object.values(store.reports).find((r) => r.orderId === orderId) || null;
+  getReportByOrderId(orderId: string): Promise<ReportRecord | null> {
+    return getActiveRepo().getReportByOrderId(orderId);
   },
 
-  getReportByAccessToken(token: string): ReportRecord | null {
-    const store = ensureStore();
-    return Object.values(store.reports).find((r) => r.accessToken === token) || null;
+  getReportByAccessToken(token: string): Promise<ReportRecord | null> {
+    return getActiveRepo().getReportByAccessToken(token);
   },
 
-  incrementReportDownload(reportId: string): void {
-    const store = ensureStore();
-    if (store.reports[reportId]) {
-      store.reports[reportId].downloadCount += 1;
-      saveStore(store);
-    }
+  verifyReportToken(orderId: string, token: string): Promise<boolean> {
+    return getActiveRepo().verifyReportToken(orderId, token);
   },
 
-  isWebhookEventProcessed(eventId: string): boolean {
-    const store = ensureStore();
-    return Boolean(store.processedWebhookEvents && store.processedWebhookEvents[eventId]);
+  incrementReportDownload(reportId: string): Promise<void> {
+    return getActiveRepo().incrementReportDownload(reportId);
   },
 
-  recordWebhookEvent(eventId: string, eventType: string): void {
-    const store = ensureStore();
-    if (!store.processedWebhookEvents) store.processedWebhookEvents = {};
-    store.processedWebhookEvents[eventId] = {
-      eventId,
-      eventType,
-      processedAt: new Date().toISOString(),
-    };
-    saveStore(store);
+  isWebhookEventProcessed(eventId: string): Promise<boolean> {
+    return getActiveRepo().isWebhookEventProcessed(eventId);
   },
 
-  checkAdminRateLimit(ip: string): { allowed: boolean; remainingAttempts: number; retryAfterSeconds?: number } {
-    const store = ensureStore();
-    if (!store.adminLoginAttempts) store.adminLoginAttempts = {};
-    const record = store.adminLoginAttempts[ip];
-    const now = Date.now();
-
-    if (!record) {
-      return { allowed: true, remainingAttempts: 5 };
-    }
-
-    if (record.lockedUntil && record.lockedUntil > now) {
-      const retryAfterSeconds = Math.ceil((record.lockedUntil - now) / 1000);
-      return { allowed: false, remainingAttempts: 0, retryAfterSeconds };
-    }
-
-    // Reset window after 15 minutes of inactivity
-    if (now - record.lastAttempt > 15 * 60 * 1000) {
-      record.attempts = 0;
-      record.lockedUntil = undefined;
-      saveStore(store);
-      return { allowed: true, remainingAttempts: 5 };
-    }
-
-    const remaining = Math.max(0, 5 - record.attempts);
-    return { allowed: remaining > 0, remainingAttempts: remaining };
+  recordWebhookEvent(eventId: string, eventType: string, payload?: Record<string, any>): Promise<boolean> {
+    return getActiveRepo().recordWebhookEvent(eventId, eventType, payload);
   },
 
-  recordAdminAttempt(ip: string, success: boolean): void {
-    const store = ensureStore();
-    if (!store.adminLoginAttempts) store.adminLoginAttempts = {};
-    const now = Date.now();
+  checkAdminRateLimit(ip: string): Promise<{
+    allowed: boolean;
+    remainingAttempts: number;
+    retryAfterSeconds?: number;
+  }> {
+    return getActiveRepo().checkAdminRateLimit(ip);
+  },
 
-    if (success) {
-      // Clear failed attempts on successful login
-      delete store.adminLoginAttempts[ip];
-      saveStore(store);
-      return;
-    }
+  recordAdminAttempt(ip: string, success: boolean): Promise<void> {
+    return getActiveRepo().recordAdminAttempt(ip, success);
+  },
 
-    const record = store.adminLoginAttempts[ip] || { attempts: 0, lastAttempt: now };
-    record.attempts += 1;
-    record.lastAttempt = now;
+  createSession(data: {
+    assessmentSlug: string;
+    guestSessionToken: string;
+    guestEmail?: string;
+    guestName?: string;
+  }): Promise<AssessmentSessionRecord> {
+    return getActiveRepo().createSession(data);
+  },
 
-    if (record.attempts >= 5) {
-      // Lock for 15 minutes
-      record.lockedUntil = now + 15 * 60 * 1000;
-    }
+  getSession(guestSessionToken: string): Promise<AssessmentSessionRecord | null> {
+    return getActiveRepo().getSession(guestSessionToken);
+  },
 
-    store.adminLoginAttempts[ip] = record;
-    saveStore(store);
+  saveResponses(
+    sessionId: string,
+    responses: Array<{ questionId: string; numericValue: number }>
+  ): Promise<void> {
+    return getActiveRepo().saveResponses(sessionId, responses);
+  },
+
+  saveCalculatedResult(sessionId: string, result: AssessmentResult): Promise<void> {
+    return getActiveRepo().saveCalculatedResult(sessionId, result);
   },
 };

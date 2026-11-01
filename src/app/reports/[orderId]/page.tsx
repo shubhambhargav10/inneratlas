@@ -30,11 +30,11 @@ interface ReportPageProps {
   searchParams: { token?: string };
 }
 
-export default function DigitalReportPage({ params, searchParams }: ReportPageProps) {
+export default async function DigitalReportPage({ params, searchParams }: ReportPageProps) {
   const { orderId } = params;
   const { token } = searchParams;
 
-  const order = db.getOrderById(orderId);
+  const order = await db.getOrderById(orderId);
   if (!order) {
     notFound();
   }
@@ -44,8 +44,9 @@ export default function DigitalReportPage({ params, searchParams }: ReportPagePr
     redirect(`/assessments/${order.assessmentSlug}/preview`);
   }
 
-  // Security Gate 2: Mandatory token verification (reject missing or mismatched token)
-  if (!token || !order.accessToken || token !== order.accessToken) {
+  // Security Gate 2: Mandatory token verification against hashed database token
+  const isAuthorized = token ? await db.verifyReportToken(orderId, token) : false;
+  if (!isAuthorized) {
     return (
       <div className="min-h-[70vh] flex items-center justify-center px-4 bg-canvas">
         <div className="max-w-md w-full rounded-3xl border border-[#E8E2D9] bg-white p-8 shadow-soft text-center">
@@ -69,7 +70,7 @@ export default function DigitalReportPage({ params, searchParams }: ReportPagePr
     );
   }
 
-  const report = db.getReportByOrderId(orderId);
+  const report = await db.getReportByOrderId(orderId);
   const assessment = getAssessmentBySlug(order.assessmentSlug);
   const result = order.resultPayload;
 
@@ -102,7 +103,7 @@ export default function DigitalReportPage({ params, searchParams }: ReportPagePr
 
           <div className="flex items-center space-x-3 w-full sm:w-auto">
             <a
-              href={`/api/reports/${orderId}/download?token=${token || order.accessToken}`}
+              href={`/api/reports/${orderId}/download?token=${encodeURIComponent(token || "")}`}
               download
               className="flex-1 sm:flex-initial inline-flex items-center justify-center space-x-2 px-4 py-2.5 rounded-xl bg-ink text-white text-xs sm:text-sm font-semibold shadow-soft hover:bg-ink-light transition-all active:scale-95"
             >

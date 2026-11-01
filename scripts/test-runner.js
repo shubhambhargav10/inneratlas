@@ -86,7 +86,7 @@ async function runTestSuite() {
 
   // Scenario 10: Order Creation
   console.log("\n--- SCENARIO 10: Server-Side Order Generation ---");
-  const order = db.createOrder({
+  const order = await db.createOrder({
     guestSessionToken: parsedSession.guestSessionToken,
     assessmentSlug: "personality-archetype",
     customerName: "Priya Nair",
@@ -105,10 +105,11 @@ async function runTestSuite() {
   const mockPaymentId = "pay_rzp_mock_test_001";
   const mockSignature = "sig_hmac_sha256_mock_valid";
 
-  const { order: paidOrder, report } = db.markOrderAsPaid(order.id, mockPaymentId, mockSignature);
+  const { order: paidOrder, report, accessToken } = await db.markOrderAsPaid(order.id, mockPaymentId, mockSignature);
   assert(paidOrder.status === "paid", "Order status successfully updated to 'paid'.");
   assert(report.reportCode.startsWith("DOSSIER-"), `Report Dossier issued: ${report.reportCode}`);
-  assert(report.accessToken.startsWith("acc_"), `Cryptographic access token generated: ${report.accessToken}`);
+  assert(accessToken.startsWith("acc_"), `Cryptographic access token generated: ${accessToken}`);
+  assert(report.accessTokenHash.length === 64, "Access token stored as 64-character SHA-256 hash in database.");
 
   // Scenario 13 & 14: PDF Generation & Download
   console.log("\n--- SCENARIO 13 & 14: PDF Dossier Generation & Download ---");
@@ -125,7 +126,7 @@ async function runTestSuite() {
 
   // Scenario 15: Failed / Unpaid Order Security Gate
   console.log("\n--- SCENARIO 15: Security Gate — Unpaid Order Gating ---");
-  const unpaidOrder = db.createOrder({
+  const unpaidOrder = await db.createOrder({
     guestSessionToken: "gst_unpaid_attempt",
     assessmentSlug: "personality-archetype",
     customerName: "Hacker Try",
@@ -135,26 +136,27 @@ async function runTestSuite() {
   });
 
   assert(unpaidOrder.status === "created", "Unpaid order has status 'created'.");
-  const unpaidReport = db.getReportByOrderId(unpaidOrder.id);
+  const unpaidReport = await db.getReportByOrderId(unpaidOrder.id);
   assert(unpaidReport === null, "Report dossier does NOT exist for unpaid order.");
 
   // Scenario 16: Idempotent Webhook / Re-verification
   console.log("\n--- SCENARIO 16: Idempotency Protection ---");
-  const reVerify = db.markOrderAsPaid(order.id, mockPaymentId, mockSignature);
+  const reVerify = await db.markOrderAsPaid(order.id, mockPaymentId, mockSignature);
   assert(reVerify.report.reportCode === report.reportCode, "Duplicate payment trigger returns existing report without creating duplicates.");
 
   // Scenario 17: Access Token Security Isolation
   console.log("\n--- SCENARIO 17: Unauthorized Access Token Isolation ---");
-  const correctReport = db.getReportByAccessToken(report.accessToken);
-  const fakeReport = db.getReportByAccessToken("acc_invalid_fake_token_attempt");
+  const correctReport = await db.getReportByAccessToken(accessToken);
+  const fakeReport = await db.getReportByAccessToken("acc_invalid_fake_token_attempt");
   assert(correctReport !== null, "Authorized access token retrieves the report.");
   assert(fakeReport === null, "Unauthorized token cannot access any report.");
 
-  // Scenario 18: Dashboard Email Lookup
-  console.log("\n--- SCENARIO 18: Dashboard Report Lookup By Email ---");
-  const retrievedOrders = db.getOrdersByEmail("priya.nair@example.com");
-  assert(retrievedOrders.length >= 1, `Found ${retrievedOrders.length} order(s) for customer email.`);
-  assert(retrievedOrders[0].customerName === "Priya Nair", "Customer name matches.");
+  // Scenario 18: Authorized Dossier Verification via Cryptographic Token Hash
+  console.log("\n--- SCENARIO 18: Authorized Verification via Cryptographic Token Hash ---");
+  const isValid = await db.verifyReportToken(paidOrder.id, accessToken);
+  const isInvalid = await db.verifyReportToken(paidOrder.id, "acc_wrong_tampered_token");
+  assert(isValid === true, "Authorized token successfully verified against database hash.");
+  assert(isInvalid === false, "Tampered token rejected by timing-safe hash verification.");
 
   console.log("\n=======================================================");
   console.log(`   SUITE COMPLETE: ${testsPassed} TESTS PASSED, ${testsFailed} FAILED   `);

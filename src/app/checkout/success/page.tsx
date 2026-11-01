@@ -10,7 +10,7 @@ interface SuccessPageProps {
   };
 }
 
-export default function CheckoutSuccessPage({ searchParams }: SuccessPageProps) {
+export default async function CheckoutSuccessPage({ searchParams }: SuccessPageProps) {
   const { orderId, token } = searchParams;
 
   if (!orderId) {
@@ -31,8 +31,8 @@ export default function CheckoutSuccessPage({ searchParams }: SuccessPageProps) 
     );
   }
 
-  const order = db.getOrderById(orderId);
-  const report = db.getReportByOrderId(orderId);
+  const order = await db.getOrderById(orderId);
+  const report = await db.getReportByOrderId(orderId);
 
   return (
     <div className="max-w-3xl mx-auto px-4 sm:px-6 py-12 md:py-20">

@@ -98,7 +98,7 @@ export async function POST(req: NextRequest) {
     }
 
     // Persist order in server data layer
-    const order = db.createOrder({
+    const order = await db.createOrder({
       guestSessionToken,
       assessmentSlug,
       customerName,

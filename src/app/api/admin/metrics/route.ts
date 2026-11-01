@@ -11,7 +11,7 @@ export async function POST(req: NextRequest) {
       "127.0.0.1";
 
     // 1. IP-based Rate Limiting (Protection against brute-force attacks)
-    const rateLimit = db.checkAdminRateLimit(clientIp);
+    const rateLimit = await db.checkAdminRateLimit(clientIp);
     if (!rateLimit.allowed) {
       console.warn(`[Security Alert] Rate-limited admin login attempt from ${clientIp}`);
       return NextResponse.json(
@@ -50,7 +50,7 @@ export async function POST(req: NextRequest) {
 
     // 3. Constant-time timing-safe secret key verification
     if (typeof secretKey !== "string") {
-      db.recordAdminAttempt(clientIp, false);
+      await db.recordAdminAttempt(clientIp, false);
       return NextResponse.json({ error: "Invalid credentials format." }, { status: 400 });
     }
 
@@ -62,7 +62,7 @@ export async function POST(req: NextRequest) {
       crypto.timingSafeEqual(expectedBuf, actualBuf);
 
     if (!isMatch) {
-      db.recordAdminAttempt(clientIp, false);
+      await db.recordAdminAttempt(clientIp, false);
       console.warn(`[Admin Security Alert] Unauthorized admin login attempt from ${clientIp}`);
       return NextResponse.json(
         { error: "Unauthorized access: Invalid admin key." },
@@ -71,9 +71,9 @@ export async function POST(req: NextRequest) {
     }
 
     // Success: Clear failed attempts
-    db.recordAdminAttempt(clientIp, true);
+    await db.recordAdminAttempt(clientIp, true);
 
-    const allOrders = db.getAllOrders();
+    const allOrders = await db.getAllOrders();
     const paidOrders = allOrders.filter((o) => o.status === "paid");
     const totalRevenuePaise = paidOrders.reduce((acc, curr) => acc + curr.amountPaise, 0);
 
