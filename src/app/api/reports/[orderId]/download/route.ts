@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db/store";
 import { getAssessmentBySlug } from "@/data/assessments";
 import { generatePdfBuffer } from "@/lib/pdf/reportGenerator";
+import crypto from "crypto";
 
 export async function GET(
   req: NextRequest,
@@ -12,26 +13,64 @@ export async function GET(
     const { searchParams } = new URL(req.url);
     const token = searchParams.get("token");
 
+    // 1. Mandatory access token validation (fail closed if missing)
+    if (!token || typeof token !== "string" || token.trim().length === 0) {
+      return new NextResponse("Unauthorized: Access token is strictly required to download report.", {
+        status: 401,
+        headers: {
+          "Cache-Control": "no-store, no-cache, must-revalidate, private",
+          "Referrer-Policy": "no-referrer",
+          "X-Robots-Tag": "noindex, nofollow, noarchive",
+        },
+      });
+    }
+
     const order = db.getOrderById(orderId);
     if (!order) {
-      return new NextResponse("Order not found", { status: 404 });
+      return new NextResponse("Report not found.", {
+        status: 404,
+        headers: {
+          "Cache-Control": "no-store, no-cache, must-revalidate, private",
+          "X-Robots-Tag": "noindex, nofollow",
+        },
+      });
     }
 
-    // Security Gate: Order must be paid
+    // 2. Security Gate: Order must be in confirmed paid status
     if (order.status !== "paid") {
-      return new NextResponse("Payment required to unlock this report", { status: 403 });
+      return new NextResponse("Forbidden: Payment required to unlock this report.", {
+        status: 403,
+        headers: {
+          "Cache-Control": "no-store, no-cache, must-revalidate, private",
+          "X-Robots-Tag": "noindex, nofollow",
+        },
+      });
     }
 
-    // Token verification (prevents brute-force ID scraping)
-    if (token && order.accessToken && token !== order.accessToken) {
-      return new NextResponse("Unauthorized access token", { status: 401 });
+    // 3. Cryptographic timing-safe token verification
+    if (!order.accessToken) {
+      return new NextResponse("Unauthorized: Report has not been issued.", { status: 401 });
+    }
+
+    const tokenBuf = Buffer.from(token, "utf-8");
+    const orderTokenBuf = Buffer.from(order.accessToken, "utf-8");
+
+    if (tokenBuf.length !== orderTokenBuf.length || !crypto.timingSafeEqual(tokenBuf, orderTokenBuf)) {
+      return new NextResponse("Unauthorized: Invalid access token.", {
+        status: 401,
+        headers: {
+          "Cache-Control": "no-store, no-cache, must-revalidate, private",
+          "Referrer-Policy": "no-referrer",
+          "X-Robots-Tag": "noindex, nofollow",
+        },
+      });
     }
 
     const report = db.getReportByOrderId(orderId);
     const assessment = getAssessmentBySlug(order.assessmentSlug);
     const assessmentTitle = assessment ? assessment.title : "Psychometric Assessment";
 
-    // Generate high-resolution PDF binary buffer
+    // 4. Generate high-resolution vector PDF binary buffer
     const pdfBuffer = await generatePdfBuffer({
       customerName: order.customerName,
       reportCode: report?.reportCode || order.orderNumber,
@@ -45,16 +84,25 @@ export async function GET(
 
     const fileName = `InnerAtlas-Report-${report?.reportCode || order.orderNumber}.pdf`;
 
+    // 5. Strict security and no-store cache headers
     return new NextResponse(new Uint8Array(pdfBuffer), {
       status: 200,
       headers: {
         "Content-Type": "application/pdf",
         "Content-Disposition": `attachment; filename="${fileName}"`,
-        "Cache-Control": "private, max-age=3600",
+        "Cache-Control": "no-store, no-cache, must-revalidate, private",
+        "Pragma": "no-cache",
+        "Expires": "0",
+        "Referrer-Policy": "no-referrer",
+        "X-Robots-Tag": "noindex, nofollow, noarchive",
+        "X-Content-Type-Options": "nosniff",
       },
     });
   } catch (error: any) {
-    console.error("PDF generation/download error:", error);
-    return new NextResponse("Failed to generate PDF report", { status: 500 });
+    console.error("[Download Error]:", error);
+    return new NextResponse("Failed to generate PDF report.", {
+      status: 500,
+      headers: { "Cache-Control": "no-store" },
+    });
   }
 }

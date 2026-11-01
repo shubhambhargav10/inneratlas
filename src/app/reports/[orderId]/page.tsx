@@ -16,6 +16,15 @@ import {
   Compass,
 } from "lucide-react";
 
+export const metadata = {
+  title: "Personal Psychometric Dossier | INNERATLAS",
+  robots: {
+    index: false,
+    follow: false,
+    nocache: true,
+  },
+};
+
 interface ReportPageProps {
   params: { orderId: string };
   searchParams: { token?: string };
@@ -30,14 +39,34 @@ export default function DigitalReportPage({ params, searchParams }: ReportPagePr
     notFound();
   }
 
-  // Security Gate: Ensure order is paid
+  // Security Gate 1: Ensure order is paid
   if (order.status !== "paid") {
     redirect(`/assessments/${order.assessmentSlug}/preview`);
   }
 
-  // Token verification check if present
-  if (token && order.accessToken && token !== order.accessToken) {
-    redirect(`/assessments/${order.assessmentSlug}/preview`);
+  // Security Gate 2: Mandatory token verification (reject missing or mismatched token)
+  if (!token || !order.accessToken || token !== order.accessToken) {
+    return (
+      <div className="min-h-[70vh] flex items-center justify-center px-4 bg-canvas">
+        <div className="max-w-md w-full rounded-3xl border border-[#E8E2D9] bg-white p-8 shadow-soft text-center">
+          <div className="w-12 h-12 rounded-full bg-accent-coral/10 text-accent-coral flex items-center justify-center mx-auto mb-4">
+            <ShieldCheck className="w-6 h-6" />
+          </div>
+          <h1 className="text-xl font-serif font-semibold text-ink mb-2">
+            Access Token Required
+          </h1>
+          <p className="text-xs text-ink-muted leading-relaxed mb-6">
+            To protect customer confidentiality, personal dossiers can only be viewed using the secure link provided during checkout.
+          </p>
+          <Link
+            href="/dashboard"
+            className="inline-flex items-center space-x-2 px-5 py-2.5 rounded-xl bg-ink text-white text-xs font-semibold shadow-soft hover:bg-ink-light transition-all"
+          >
+            <span>Go to Member Hub</span>
+          </Link>
+        </div>
+      </div>
+    );
   }
 
   const report = db.getReportByOrderId(orderId);

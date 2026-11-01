@@ -41,6 +41,8 @@ export interface ReportRecord {
 interface LocalStoreSchema {
   orders: Record<string, OrderRecord>;
   reports: Record<string, ReportRecord>;
+  processedWebhookEvents?: Record<string, { eventId: string; eventType: string; processedAt: string }>;
+  adminLoginAttempts?: Record<string, { attempts: number; lastAttempt: number; lockedUntil?: number }>;
 }
 
 const DATA_DIR = path.join(process.cwd(), ".data");
@@ -51,15 +53,30 @@ function ensureStore(): LocalStoreSchema {
     fs.mkdirSync(DATA_DIR, { recursive: true });
   }
   if (!fs.existsSync(STORE_FILE)) {
-    const initial: LocalStoreSchema = { orders: {}, reports: {} };
+    const initial: LocalStoreSchema = {
+      orders: {},
+      reports: {},
+      processedWebhookEvents: {},
+      adminLoginAttempts: {},
+    };
     fs.writeFileSync(STORE_FILE, JSON.stringify(initial, null, 2));
     return initial;
   }
   try {
     const content = fs.readFileSync(STORE_FILE, "utf-8");
-    return JSON.parse(content);
+    const parsed = JSON.parse(content);
+    if (!parsed.orders) parsed.orders = {};
+    if (!parsed.reports) parsed.reports = {};
+    if (!parsed.processedWebhookEvents) parsed.processedWebhookEvents = {};
+    if (!parsed.adminLoginAttempts) parsed.adminLoginAttempts = {};
+    return parsed;
   } catch (err) {
-    return { orders: {}, reports: {} };
+    return {
+      orders: {},
+      reports: {},
+      processedWebhookEvents: {},
+      adminLoginAttempts: {},
+    };
   }
 }
 
@@ -130,6 +147,18 @@ export const db = {
     );
   },
 
+  markOrderAsFailed(orderId: string, reason?: string): OrderRecord {
+    const store = ensureStore();
+    const order = store.orders[orderId];
+    if (!order) {
+      throw new Error(`Order ${orderId} not found`);
+    }
+    order.status = "failed";
+    order.updatedAt = new Date().toISOString();
+    saveStore(store);
+    return order;
+  },
+
   markOrderAsPaid(
     orderId: string,
     paymentId: string,
@@ -193,5 +222,73 @@ export const db = {
       store.reports[reportId].downloadCount += 1;
       saveStore(store);
     }
+  },
+
+  isWebhookEventProcessed(eventId: string): boolean {
+    const store = ensureStore();
+    return Boolean(store.processedWebhookEvents && store.processedWebhookEvents[eventId]);
+  },
+
+  recordWebhookEvent(eventId: string, eventType: string): void {
+    const store = ensureStore();
+    if (!store.processedWebhookEvents) store.processedWebhookEvents = {};
+    store.processedWebhookEvents[eventId] = {
+      eventId,
+      eventType,
+      processedAt: new Date().toISOString(),
+    };
+    saveStore(store);
+  },
+
+  checkAdminRateLimit(ip: string): { allowed: boolean; remainingAttempts: number; retryAfterSeconds?: number } {
+    const store = ensureStore();
+    if (!store.adminLoginAttempts) store.adminLoginAttempts = {};
+    const record = store.adminLoginAttempts[ip];
+    const now = Date.now();
+
+    if (!record) {
+      return { allowed: true, remainingAttempts: 5 };
+    }
+
+    if (record.lockedUntil && record.lockedUntil > now) {
+      const retryAfterSeconds = Math.ceil((record.lockedUntil - now) / 1000);
+      return { allowed: false, remainingAttempts: 0, retryAfterSeconds };
+    }
+
+    // Reset window after 15 minutes of inactivity
+    if (now - record.lastAttempt > 15 * 60 * 1000) {
+      record.attempts = 0;
+      record.lockedUntil = undefined;
+      saveStore(store);
+      return { allowed: true, remainingAttempts: 5 };
+    }
+
+    const remaining = Math.max(0, 5 - record.attempts);
+    return { allowed: remaining > 0, remainingAttempts: remaining };
+  },
+
+  recordAdminAttempt(ip: string, success: boolean): void {
+    const store = ensureStore();
+    if (!store.adminLoginAttempts) store.adminLoginAttempts = {};
+    const now = Date.now();
+
+    if (success) {
+      // Clear failed attempts on successful login
+      delete store.adminLoginAttempts[ip];
+      saveStore(store);
+      return;
+    }
+
+    const record = store.adminLoginAttempts[ip] || { attempts: 0, lastAttempt: now };
+    record.attempts += 1;
+    record.lastAttempt = now;
+
+    if (record.attempts >= 5) {
+      // Lock for 15 minutes
+      record.lockedUntil = now + 15 * 60 * 1000;
+    }
+
+    store.adminLoginAttempts[ip] = record;
+    saveStore(store);
   },
 };

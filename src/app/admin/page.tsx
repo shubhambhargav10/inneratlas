@@ -303,8 +303,7 @@ export default function AdminDashboardPage() {
                     <th className="pb-3 font-semibold">Assessment</th>
                     <th className="pb-3 font-semibold">Amount</th>
                     <th className="pb-3 font-semibold">Status</th>
-                    <th className="pb-3 font-semibold">Date</th>
-                    <th className="pb-3 font-semibold text-right">Actions</th>
+                    <th className="pb-3 font-semibold text-right">Date</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#E8E2D9]/60">
@@ -334,32 +333,11 @@ export default function AdminDashboardPage() {
                           {ord.status}
                         </span>
                       </td>
-                      <td className="py-3.5 text-ink-muted">
+                      <td className="py-3.5 text-right text-ink-muted">
                         {new Date(ord.createdAt).toLocaleDateString("en-IN", {
                           day: "numeric",
                           month: "short",
                         })}
-                      </td>
-                      <td className="py-3.5 text-right">
-                        {ord.status === "paid" && (
-                          <div className="inline-flex items-center space-x-2">
-                            <a
-                              href={`/api/reports/${ord.id}/download?token=${ord.accessToken}`}
-                              download
-                              className="p-1.5 rounded-lg text-ink-muted hover:text-ink hover:bg-canvas transition-colors"
-                              title="Download PDF"
-                            >
-                              <Download className="w-4 h-4" />
-                            </a>
-                            <Link
-                              href={`/reports/${ord.id}?token=${ord.accessToken}`}
-                              className="p-1.5 rounded-lg text-ink-muted hover:text-ink hover:bg-canvas transition-colors"
-                              title="View Online"
-                            >
-                              <ExternalLink className="w-4 h-4" />
-                            </Link>
-                          </div>
-                        )}
                       </td>
                     </tr>
                   ))}

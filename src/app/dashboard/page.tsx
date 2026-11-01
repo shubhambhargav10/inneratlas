@@ -2,39 +2,27 @@
 
 import React, { useState, useEffect } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { allAssessments } from "@/data/assessments";
 import { getStoredSession } from "@/lib/session/clientStorage";
 import {
   FileText,
   Download,
   ExternalLink,
-  Search,
+  ShieldCheck,
+  Key,
   Sparkles,
   ArrowRight,
   Clock,
-  CheckCircle2,
+  HelpCircle,
   Lock,
 } from "lucide-react";
 
-interface OrderSummary {
-  orderId: string;
-  orderNumber: string;
-  assessmentSlug: string;
-  customerName: string;
-  customerEmail: string;
-  amountPaise: number;
-  status: string;
-  reportCode?: string;
-  accessToken?: string;
-  createdAt: string;
-}
-
 export default function UserDashboardPage() {
-  const [emailInput, setEmailInput] = useState("");
-  const [searchedEmail, setSearchedEmail] = useState("");
-  const [orders, setOrders] = useState<OrderSummary[]>([]);
-  const [isSearching, setIsSearching] = useState(false);
-  const [hasSearched, setHasSearched] = useState(false);
+  const router = useRouter();
+  const [orderIdInput, setOrderIdInput] = useState("");
+  const [tokenInput, setTokenInput] = useState("");
+  const [errorMessage, setErrorMessage] = useState("");
 
   // In-progress local sessions detected in browser
   const [localSessions, setLocalSessions] = useState<
@@ -48,7 +36,7 @@ export default function UserDashboardPage() {
   >([]);
 
   useEffect(() => {
-    // Check local storage for active sessions
+    // Check local storage for active sessions on this device
     const detected: typeof localSessions = [];
     allAssessments.forEach((asm) => {
       const saved = getStoredSession(asm.slug);
@@ -65,27 +53,20 @@ export default function UserDashboardPage() {
     setLocalSessions(detected);
   }, []);
 
-  const handleLookup = async (e: React.FormEvent) => {
+  const handleAccessReport = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!emailInput) return;
+    setErrorMessage("");
 
-    setIsSearching(true);
-    setHasSearched(true);
-    setSearchedEmail(emailInput);
+    const trimmedOrder = orderIdInput.trim();
+    const trimmedToken = tokenInput.trim();
 
-    try {
-      const res = await fetch(`/api/user/reports?email=${encodeURIComponent(emailInput)}`);
-      const data = await res.json();
-      if (res.ok && data.orders) {
-        setOrders(data.orders);
-      } else {
-        setOrders([]);
-      }
-    } catch (err) {
-      setOrders([]);
-    } finally {
-      setIsSearching(false);
+    if (!trimmedOrder || !trimmedToken) {
+      setErrorMessage("Please enter both your Order ID and Access Token.");
+      return;
     }
+
+    // Direct client to the authorized report viewer
+    router.push(`/reports/${trimmedOrder}?token=${encodeURIComponent(trimmedToken)}`);
   };
 
   return (
@@ -100,103 +81,77 @@ export default function UserDashboardPage() {
             My Assessments & Reports
           </h1>
           <p className="text-sm sm:text-base text-ink-muted">
-            Access your past assessment results, download official 12-page PDF dossiers, or resume any in-progress questionnaires.
+            Access your personalized PDF dossiers, resume unfinished questionnaires, or explore new psychometric assessments.
           </p>
         </div>
 
-        {/* Lookup Paid Reports Card */}
+        {/* Secure Access Form */}
         <div className="rounded-3xl border border-[#E8E2D9] bg-white p-6 sm:p-10 shadow-soft mb-12">
-          <h2 className="text-xl font-serif font-semibold text-ink mb-2">
-            Retrieve Purchased Reports
+          <div className="flex items-center space-x-2 text-xs font-bold uppercase tracking-wider text-brand-700 mb-2">
+            <ShieldCheck className="w-4 h-4 text-accent-emerald" />
+            <span>Secure Dossier Access</span>
+          </div>
+
+          <h2 className="text-xl sm:text-2xl font-serif font-semibold text-ink mb-2">
+            Access Your Purchased Dossier
           </h2>
-          <p className="text-xs sm:text-sm text-ink-muted mb-6">
-            Enter the email address you provided during checkout to find and re-download your official PDF dossiers:
+          <p className="text-xs sm:text-sm text-ink-muted mb-6 leading-relaxed">
+            To strictly safeguard your personal psychological reflections from unauthorized viewing, reports are bound to your secure credentials provided at checkout.
           </p>
 
-          <form onSubmit={handleLookup} className="flex flex-col sm:flex-row gap-3 mb-6">
-            <div className="relative flex-1">
-              <input
-                type="email"
-                required
-                placeholder="Enter your email (e.g. rahul@example.com)"
-                value={emailInput}
-                onChange={(e) => setEmailInput(e.target.value)}
-                className="w-full px-4 py-3 rounded-xl border border-[#E8E2D9] text-sm text-ink focus:outline-none focus:ring-2 focus:ring-brand-500/30 focus:border-brand-600 bg-canvas/30"
-              />
+          <form onSubmit={handleAccessReport} className="space-y-4 mb-6">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs font-semibold text-ink mb-1">
+                  Order ID
+                </label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g. ord_8638bc89b3d8e394"
+                  value={orderIdInput}
+                  onChange={(e) => setOrderIdInput(e.target.value)}
+                  className="w-full px-4 py-3 rounded-xl border border-[#E8E2D9] text-sm text-ink focus:outline-none focus:ring-2 focus:ring-brand-500/30 focus:border-brand-600 bg-canvas/30 font-mono"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-ink mb-1">
+                  Access Token
+                </label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g. acc_6b6d1477ca56ca29..."
+                  value={tokenInput}
+                  onChange={(e) => setTokenInput(e.target.value)}
+                  className="w-full px-4 py-3 rounded-xl border border-[#E8E2D9] text-sm text-ink focus:outline-none focus:ring-2 focus:ring-brand-500/30 focus:border-brand-600 bg-canvas/30 font-mono"
+                />
+              </div>
             </div>
+
+            {errorMessage && (
+              <div className="p-3 rounded-xl bg-accent-coral/10 text-accent-coral text-xs">
+                {errorMessage}
+              </div>
+            )}
+
             <button
               type="submit"
-              disabled={isSearching}
-              className="inline-flex items-center justify-center space-x-2 py-3 px-6 rounded-xl bg-ink text-white font-semibold text-sm shadow-soft hover:bg-ink-light transition-all active:scale-95 disabled:opacity-70"
+              className="inline-flex items-center justify-center space-x-2 py-3 px-6 rounded-xl bg-ink text-white font-semibold text-sm shadow-soft hover:bg-ink-light transition-all active:scale-95"
             >
-              {isSearching ? (
-                <span>Searching...</span>
-              ) : (
-                <>
-                  <Search className="w-4 h-4 text-brand-300" />
-                  <span>Find My Reports</span>
-                </>
-              )}
+              <Key className="w-4 h-4 text-brand-300" />
+              <span>Unlock & View Dossier</span>
             </button>
           </form>
 
-          {/* Search Results */}
-          {hasSearched && (
-            <div className="pt-6 border-t border-[#E8E2D9]">
-              {orders.length === 0 ? (
-                <div className="p-6 rounded-2xl bg-canvas border border-[#E8E2D9] text-center text-xs text-ink-muted">
-                  No purchased dossiers found for <strong>{searchedEmail}</strong>. If you recently completed a test, check your browser session below.
-                </div>
-              ) : (
-                <div className="space-y-4">
-                  <span className="text-xs font-bold uppercase tracking-wider text-brand-700 block mb-2">
-                    Found {orders.length} Purchased Dossier{orders.length > 1 ? "s" : ""}:
-                  </span>
-                  {orders.map((ord) => (
-                    <div
-                      key={ord.orderId}
-                      className="p-5 rounded-2xl border border-[#E8E2D9] bg-canvas flex flex-col sm:flex-row sm:items-center justify-between gap-4"
-                    >
-                      <div>
-                        <div className="flex items-center space-x-2 mb-1">
-                          <span className="text-xs font-bold text-ink">
-                            {ord.reportCode || ord.orderNumber}
-                          </span>
-                          <span className="text-[10px] uppercase font-semibold px-2 py-0.5 rounded bg-accent-emerald/10 text-accent-emerald">
-                            {ord.status}
-                          </span>
-                        </div>
-                        <p className="text-sm font-serif font-medium text-ink capitalize">
-                          {ord.assessmentSlug.replace("-", " ")} Assessment
-                        </p>
-                        <p className="text-xs text-ink-muted">
-                          Purchased on {new Date(ord.createdAt).toLocaleDateString("en-IN")}
-                        </p>
-                      </div>
-
-                      <div className="flex items-center space-x-3">
-                        <a
-                          href={`/api/reports/${ord.orderId}/download?token=${ord.accessToken}`}
-                          download
-                          className="inline-flex items-center space-x-1.5 py-2 px-4 rounded-xl bg-ink text-white text-xs font-semibold shadow-soft hover:bg-ink-light transition-all"
-                        >
-                          <Download className="w-3.5 h-3.5 text-brand-300" />
-                          <span>PDF</span>
-                        </a>
-                        <Link
-                          href={`/reports/${ord.orderId}?token=${ord.accessToken}`}
-                          className="inline-flex items-center space-x-1.5 py-2 px-4 rounded-xl bg-white border border-[#E8E2D9] text-ink text-xs font-semibold hover:bg-canvas-subtle transition-all"
-                        >
-                          <ExternalLink className="w-3.5 h-3.5 text-brand-600" />
-                          <span>View</span>
-                        </Link>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
+          {/* Privacy Disclosure Footnote */}
+          <div className="pt-4 border-t border-[#E8E2D9] flex items-start space-x-2.5 text-xs text-ink-muted">
+            <Lock className="w-4 h-4 text-brand-600 flex-shrink-0 mt-0.5" />
+            <span>
+              <strong>Privacy Protection Notice:</strong> In accordance with our security principles, arbitrary email searches are disabled so that third parties cannot enumerate or view your assessment results. If you cannot locate your credentials, please contact support.
+            </span>
+          </div>
         </div>
 
         {/* Local In-Progress or Completed Free Sessions */}

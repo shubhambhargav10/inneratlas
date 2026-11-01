@@ -1,31 +1,19 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db } from "@/lib/db/store";
 
 export async function GET(req: NextRequest) {
-  try {
-    const { searchParams } = new URL(req.url);
-    const email = searchParams.get("email");
-
-    if (!email) {
-      return NextResponse.json({ error: "Email parameter required" }, { status: 400 });
+  // Security Remediation (Task 4):
+  // Completely disabled unauthenticated email-based order enumeration.
+  // Email address alone must never authorize access or disclose raw report access tokens.
+  return NextResponse.json(
+    {
+      error:
+        "Unauthenticated email lookup has been disabled to protect customer confidentiality. Please access your dossier using the direct link provided upon checkout or enter your Order ID and Access Token in the dashboard.",
+    },
+    {
+      status: 403,
+      headers: {
+        "Cache-Control": "no-store, no-cache, must-revalidate, private",
+      },
     }
-
-    const orders = db.getOrdersByEmail(email);
-    const sanitized = orders.map((o) => ({
-      orderId: o.id,
-      orderNumber: o.orderNumber,
-      assessmentSlug: o.assessmentSlug,
-      customerName: o.customerName,
-      customerEmail: o.customerEmail,
-      amountPaise: o.amountPaise,
-      status: o.status,
-      reportCode: o.reportCode,
-      accessToken: o.accessToken,
-      createdAt: o.createdAt,
-    }));
-
-    return NextResponse.json({ orders: sanitized });
-  } catch (err: any) {
-    return NextResponse.json({ error: "Failed to fetch orders" }, { status: 500 });
-  }
+  );
 }

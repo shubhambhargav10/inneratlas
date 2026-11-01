@@ -58,18 +58,16 @@ export function ResultPreview({ assessment, result, guestSessionToken }: ResultP
         throw new Error(data.error || "Unable to initiate payment. Please try again.");
       }
 
-      // Check if test / mock mode is active (for instant test resolution without live gateway keys)
+      // Check if server returned simulated test mode (development only)
       if (data.isMockMode) {
-        // Direct test simulation: redirect to verify simulated checkout
         const verifyRes = await fetch("/api/payments/verify-signature", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             orderId: data.orderId,
-            razorpayOrderId: data.razorpayOrderId || "mock_order_id",
-            razorpayPaymentId: "pay_mock_" + Math.random().toString(36).substring(2, 10),
-            razorpaySignature: "mock_signature_verified",
-            isMockVerification: true,
+            razorpayOrderId: data.razorpayOrderId,
+            razorpayPaymentId: "pay_sim_" + Math.random().toString(36).substring(2, 10),
+            razorpaySignature: `sim_dev_sig_${data.orderId}`,
           }),
         });
 
@@ -77,6 +75,8 @@ export function ResultPreview({ assessment, result, guestSessionToken }: ResultP
         if (verifyData.success) {
           window.location.href = `/checkout/success?orderId=${data.orderId}&token=${verifyData.accessToken}`;
           return;
+        } else {
+          throw new Error(verifyData.error || "Simulated verification failed.");
         }
       }
 
