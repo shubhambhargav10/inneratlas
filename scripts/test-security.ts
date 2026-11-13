@@ -342,7 +342,8 @@ async function runSecuritySuite() {
   console.log("\n--- 2. REPORT DOWNLOAD AUTHORIZATION TESTS ---");
 
   const paidOrder = (await db.getOrderById(testOrder.id))!;
-  const fulfillment = await db.markOrderAsPaid(testOrder.id, "pay_valid_001", "sig_valid_001");
+  const paymentIdForAuth = paidOrder.razorpayPaymentId || "pay_valid_001";
+  const fulfillment = await db.markOrderAsPaid(testOrder.id, paymentIdForAuth, "sig_valid_001");
   const validToken = fulfillment.accessToken;
 
   // Create an unpaid order for testing

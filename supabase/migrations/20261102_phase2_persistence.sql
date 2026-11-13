@@ -135,7 +135,8 @@ CREATE TABLE IF NOT EXISTS public.assessment_versions (
     published_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
-    UNIQUE(assessment_id, version_number)
+    UNIQUE(assessment_id, version_number),
+    UNIQUE(id, assessment_id) -- Enables composite foreign key from assessment_sessions
 );
 
 DROP TRIGGER IF EXISTS trg_assessment_versions_updated_at ON public.assessment_versions;
@@ -177,7 +178,8 @@ CREATE TABLE IF NOT EXISTS public.questions (
     created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
     UNIQUE(version_id, question_code),
-    UNIQUE(version_id, order_index)
+    UNIQUE(version_id, order_index),
+    UNIQUE(id, version_id) -- Enables composite foreign key from user_responses
 );
 
 DROP TRIGGER IF EXISTS trg_questions_updated_at ON public.questions;
@@ -198,14 +200,123 @@ CREATE TABLE IF NOT EXISTS public.answer_options (
     UNIQUE(question_id, order_index)
 );
 
+-- ------------------------------------------------------------------------------
+-- Published Assessment Immutability Triggers
+-- Prevents modification or deletion of published/archived versions, questions,
+-- scoring dimensions, and answer options, while allowing full editing for drafts.
+-- ------------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION public.enforce_assessment_version_immutability()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        IF OLD.status IN ('published', 'archived') THEN
+            RAISE EXCEPTION 'Cannot delete % assessment version % (id: %). Published and archived versions are permanently immutable for historical integrity.',
+                OLD.status, OLD.version_number, OLD.id;
+        END IF;
+        RETURN OLD;
+    END IF;
+
+    IF TG_OP = 'UPDATE' THEN
+        -- If already published or archived, enforce strict field immutability
+        IF OLD.status IN ('published', 'archived') THEN
+            IF NEW.assessment_id IS DISTINCT FROM OLD.assessment_id THEN
+                RAISE EXCEPTION 'Cannot change assessment_id of % version %', OLD.status, OLD.id;
+            END IF;
+            IF NEW.version_number IS DISTINCT FROM OLD.version_number THEN
+                RAISE EXCEPTION 'Cannot change version_number of % version %', OLD.status, OLD.id;
+            END IF;
+            IF NEW.published_at IS DISTINCT FROM OLD.published_at THEN
+                RAISE EXCEPTION 'Cannot change published_at timestamp of % version %', OLD.status, OLD.id;
+            END IF;
+            IF OLD.status = 'published' AND NEW.status NOT IN ('published', 'archived') THEN
+                RAISE EXCEPTION 'Cannot revert published assessment version % back to draft.', OLD.id;
+            END IF;
+            IF OLD.status = 'archived' AND NEW.status != 'archived' THEN
+                RAISE EXCEPTION 'Cannot modify status of archived assessment version %.', OLD.id;
+            END IF;
+            -- Permitted updates on published version: transition status to 'archived', changelog updates
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_assessment_versions_immutability ON public.assessment_versions;
+CREATE TRIGGER trg_assessment_versions_immutability
+    BEFORE UPDATE OR DELETE ON public.assessment_versions
+    FOR EACH ROW
+    EXECUTE FUNCTION public.enforce_assessment_version_immutability();
+
+CREATE OR REPLACE FUNCTION public.enforce_assessment_content_immutability()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+    v_version_id UUID;
+    v_status TEXT;
+BEGIN
+    IF TG_TABLE_NAME = 'scoring_dimensions' THEN
+        v_version_id := CASE WHEN TG_OP = 'DELETE' THEN OLD.version_id ELSE NEW.version_id END;
+    ELSIF TG_TABLE_NAME = 'questions' THEN
+        v_version_id := CASE WHEN TG_OP = 'DELETE' THEN OLD.version_id ELSE NEW.version_id END;
+    ELSIF TG_TABLE_NAME = 'answer_options' THEN
+        SELECT q.version_id INTO v_version_id
+        FROM public.questions q
+        WHERE q.id = (CASE WHEN TG_OP = 'DELETE' THEN OLD.question_id ELSE NEW.question_id END);
+    END IF;
+
+    IF v_version_id IS NOT NULL THEN
+        SELECT status INTO v_status
+        FROM public.assessment_versions
+        WHERE id = v_version_id;
+
+        IF v_status IN ('published', 'archived') THEN
+            RAISE EXCEPTION 'Cannot % % on % assessment version (version_id: %). Content is immutable once published.',
+                TG_OP, TG_TABLE_NAME, v_status, v_version_id;
+        END IF;
+    END IF;
+
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    ELSE
+        RETURN NEW;
+    END IF;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_scoring_dimensions_immutability ON public.scoring_dimensions;
+CREATE TRIGGER trg_scoring_dimensions_immutability
+    BEFORE INSERT OR UPDATE OR DELETE ON public.scoring_dimensions
+    FOR EACH ROW
+    EXECUTE FUNCTION public.enforce_assessment_content_immutability();
+
+DROP TRIGGER IF EXISTS trg_questions_immutability ON public.questions;
+CREATE TRIGGER trg_questions_immutability
+    BEFORE INSERT OR UPDATE OR DELETE ON public.questions
+    FOR EACH ROW
+    EXECUTE FUNCTION public.enforce_assessment_content_immutability();
+
+DROP TRIGGER IF EXISTS trg_answer_options_immutability ON public.answer_options;
+CREATE TRIGGER trg_answer_options_immutability
+    BEFORE INSERT OR UPDATE OR DELETE ON public.answer_options
+    FOR EACH ROW
+    EXECUTE FUNCTION public.enforce_assessment_content_immutability();
+
 -- ==============================================================================
--- 5. SESSIONS, RESPONSES & RESULTS
+-- 5. SESSIONS, RESPONSES & RESULTS (RELATIONAL INTEGRITY ENFORCED)
 -- ==============================================================================
 
 CREATE TABLE IF NOT EXISTS public.assessment_sessions (
     id TEXT PRIMARY KEY DEFAULT ('sess_' || substr(md5(random()::text || clock_timestamp()::text), 1, 16)),
-    assessment_id UUID REFERENCES public.assessments(id) ON DELETE RESTRICT,
-    version_id UUID REFERENCES public.assessment_versions(id) ON DELETE RESTRICT,
+    assessment_id UUID NOT NULL REFERENCES public.assessments(id) ON DELETE RESTRICT,
+    version_id UUID NOT NULL REFERENCES public.assessment_versions(id) ON DELETE RESTRICT,
     assessment_slug TEXT NOT NULL,
     user_id UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
     guest_session_token TEXT NOT NULL UNIQUE,
@@ -218,7 +329,12 @@ CREATE TABLE IF NOT EXISTS public.assessment_sessions (
     ip_hash TEXT,
     user_agent TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
+    UNIQUE(id, version_id), -- Enables composite foreign key from user_responses
+    CONSTRAINT fk_session_assessment_version
+        FOREIGN KEY (version_id, assessment_id)
+        REFERENCES public.assessment_versions(id, assessment_id)
+        ON DELETE RESTRICT
 );
 
 DROP TRIGGER IF EXISTS trg_assessment_sessions_updated_at ON public.assessment_sessions;
@@ -227,16 +343,90 @@ CREATE TRIGGER trg_assessment_sessions_updated_at
     FOR EACH ROW
     EXECUTE FUNCTION public.set_updated_at();
 
--- User responses with UUID type matching questions.id and foreign-key integrity
+-- Auto-resolve assessment_id and version_id from slug if omitted
+CREATE OR REPLACE FUNCTION public.sync_assessment_session_version()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+    IF NEW.assessment_id IS NULL THEN
+        SELECT a.id INTO NEW.assessment_id
+        FROM public.assessments a
+        WHERE a.slug = NEW.assessment_slug;
+
+        IF NEW.assessment_id IS NULL THEN
+            RAISE EXCEPTION 'Assessment with slug % not found', NEW.assessment_slug;
+        END IF;
+    END IF;
+
+    IF NEW.version_id IS NULL THEN
+        SELECT av.id INTO NEW.version_id
+        FROM public.assessment_versions av
+        WHERE av.assessment_id = NEW.assessment_id AND av.status = 'published'
+        ORDER BY av.version_number DESC
+        LIMIT 1;
+
+        IF NEW.version_id IS NULL THEN
+            RAISE EXCEPTION 'No published version found for assessment %', NEW.assessment_slug;
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_sync_assessment_session_version ON public.assessment_sessions;
+CREATE TRIGGER trg_sync_assessment_session_version
+    BEFORE INSERT ON public.assessment_sessions
+    FOR EACH ROW
+    EXECUTE FUNCTION public.sync_assessment_session_version();
+
+-- User responses with composite foreign keys enforcing version alignment
 CREATE TABLE IF NOT EXISTS public.user_responses (
     id TEXT PRIMARY KEY DEFAULT ('resp_' || substr(md5(random()::text || clock_timestamp()::text), 1, 16)),
-    session_id TEXT NOT NULL REFERENCES public.assessment_sessions(id) ON DELETE CASCADE,
-    question_id UUID NOT NULL REFERENCES public.questions(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    version_id UUID NOT NULL,
+    question_id UUID NOT NULL,
     numeric_value INTEGER NOT NULL CHECK (numeric_value BETWEEN 1 AND 5),
     response_time_ms INTEGER CHECK (response_time_ms IS NULL OR response_time_ms >= 0),
     created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
-    UNIQUE(session_id, question_id)
+    UNIQUE(session_id, question_id),
+    CONSTRAINT fk_response_session_version
+        FOREIGN KEY (session_id, version_id)
+        REFERENCES public.assessment_sessions(id, version_id)
+        ON DELETE CASCADE,
+    CONSTRAINT fk_response_question_version
+        FOREIGN KEY (question_id, version_id)
+        REFERENCES public.questions(id, version_id)
+        ON DELETE CASCADE
 );
+
+-- Auto-populate version_id from assessment_sessions if omitted
+CREATE OR REPLACE FUNCTION public.sync_user_response_version()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+    IF NEW.version_id IS NULL THEN
+        SELECT version_id INTO NEW.version_id
+        FROM public.assessment_sessions
+        WHERE id = NEW.session_id;
+
+        IF NEW.version_id IS NULL THEN
+            RAISE EXCEPTION 'Assessment session % not found or has no version_id', NEW.session_id;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_sync_user_response_version ON public.user_responses;
+CREATE TRIGGER trg_sync_user_response_version
+    BEFORE INSERT ON public.user_responses
+    FOR EACH ROW
+    EXECUTE FUNCTION public.sync_user_response_version();
 
 -- Calculated results for assessment sessions
 CREATE TABLE IF NOT EXISTS public.calculated_results (
@@ -378,6 +568,8 @@ CREATE INDEX IF NOT EXISTS idx_options_question ON public.answer_options(questio
 CREATE INDEX IF NOT EXISTS idx_sessions_token ON public.assessment_sessions(guest_session_token);
 CREATE INDEX IF NOT EXISTS idx_sessions_assessment ON public.assessment_sessions(assessment_id, version_id);
 CREATE INDEX IF NOT EXISTS idx_responses_session ON public.user_responses(session_id);
+CREATE INDEX IF NOT EXISTS idx_responses_session_version ON public.user_responses(session_id, version_id);
+CREATE INDEX IF NOT EXISTS idx_responses_question_version ON public.user_responses(question_id, version_id);
 CREATE INDEX IF NOT EXISTS idx_orders_razorpay ON public.orders(razorpay_order_id);
 CREATE INDEX IF NOT EXISTS idx_orders_email ON public.orders(customer_email);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON public.orders(status);
@@ -507,6 +699,7 @@ CREATE POLICY "Deny anon admin_rate_limits" ON public.admin_rate_limits FOR ALL 
 -- ------------------------------------------------------------------------------
 -- RPC 1: fulfill_order_payment
 -- Transactionally validates payment, marks order paid, records audit payment, and generates report record
+-- Strictly checks incoming payment ID against paid orders for idempotent conflict detection
 -- ------------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.fulfill_order_payment(
     p_order_id TEXT,
@@ -539,8 +732,26 @@ BEGIN
         RAISE EXCEPTION 'Order % not found', p_order_id;
     END IF;
 
-    -- 2. Check for idempotent already-paid state
+    -- 2. Validate payment amount
+    IF v_order.amount_paise != p_amount_paise THEN
+        RAISE EXCEPTION 'Payment amount mismatch for order %. Expected: %, Received: %',
+            p_order_id, v_order.amount_paise, p_amount_paise;
+    END IF;
+
+    -- 3. Validate payment currency
+    IF v_order.currency != p_currency THEN
+        RAISE EXCEPTION 'Payment currency mismatch for order %. Expected: %, Received: %',
+            p_order_id, v_order.currency, p_currency;
+    END IF;
+
+    -- 4. Check for idempotent already-paid state with payment conflict detection
     IF v_order.status = 'paid' THEN
+        -- If already paid, the incoming payment ID must match the recorded payment ID
+        IF v_order.razorpay_payment_id IS NOT NULL AND v_order.razorpay_payment_id != p_payment_id THEN
+            RAISE EXCEPTION 'Payment conflict: Order % is already paid with payment ID %, received conflicting payment ID %',
+                p_order_id, v_order.razorpay_payment_id, p_payment_id;
+        END IF;
+
         SELECT * INTO v_report FROM public.reports WHERE order_id = p_order_id;
         RETURN jsonb_build_object(
             'success', true,
@@ -549,18 +760,6 @@ BEGIN
             'report_code', COALESCE(v_report.report_code, v_order.report_code),
             'status', v_order.status
         );
-    END IF;
-
-    -- 3. Validate payment amount
-    IF v_order.amount_paise != p_amount_paise THEN
-        RAISE EXCEPTION 'Payment amount mismatch for order %. Expected: %, Received: %',
-            p_order_id, v_order.amount_paise, p_amount_paise;
-    END IF;
-
-    -- 4. Validate currency
-    IF v_order.currency != p_currency THEN
-        RAISE EXCEPTION 'Payment currency mismatch for order %. Expected: %, Received: %',
-            p_order_id, v_order.currency, p_currency;
     END IF;
 
     -- 5. Mark order as paid
@@ -648,6 +847,7 @@ GRANT EXECUTE ON FUNCTION public.fulfill_order_payment(TEXT, TEXT, TEXT, INTEGER
 -- ------------------------------------------------------------------------------
 -- RPC 2: record_webhook_event_idempotent
 -- Implements robust webhook state machine: received -> processing -> processed / failed
+-- Handles simultaneous first-time inserts atomically via ON CONFLICT DO NOTHING + FOR UPDATE
 -- Supports safe retry on failure and concurrency locking
 -- ------------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.record_webhook_event_idempotent(
@@ -664,19 +864,29 @@ DECLARE
     v_existing RECORD;
     v_now TIMESTAMPTZ := timezone('utc'::text, now());
 BEGIN
-    -- Select existing event with row-level lock
+    -- 1. Atomically ensure event row exists without duplicate key race conditions
+    INSERT INTO public.webhook_events (
+        event_id, event_type, status, payload, retry_count, last_attempt, created_at, updated_at
+    ) VALUES (
+        p_event_id, p_event_type, 'received', p_payload, 0, v_now, v_now, v_now
+    )
+    ON CONFLICT (event_id) DO NOTHING;
+
+    -- 2. Acquire exclusive row-level lock on the guaranteed row
     SELECT * INTO v_existing
     FROM public.webhook_events
     WHERE event_id = p_event_id
     FOR UPDATE;
 
-    IF NOT FOUND THEN
-        -- Brand new event: record as 'processing' with retry_count = 1
-        INSERT INTO public.webhook_events (
-            event_id, event_type, status, payload, retry_count, last_attempt, created_at, updated_at
-        ) VALUES (
-            p_event_id, p_event_type, 'processing', p_payload, 1, v_now, v_now, v_now
-        );
+    -- 3. Case A: First-time processing (newly inserted row with status = 'received')
+    IF v_existing.status = 'received' THEN
+        UPDATE public.webhook_events
+        SET status = 'processing',
+            retry_count = 1,
+            last_attempt = v_now,
+            updated_at = v_now
+        WHERE event_id = p_event_id;
+
         RETURN jsonb_build_object(
             'should_process', true,
             'status', 'processing',
@@ -685,7 +895,7 @@ BEGIN
         );
     END IF;
 
-    -- If event is already processed successfully, reject re-processing
+    -- 4. Case B: Event already successfully processed
     IF v_existing.status = 'processed' THEN
         RETURN jsonb_build_object(
             'should_process', false,
@@ -695,7 +905,7 @@ BEGIN
         );
     END IF;
 
-    -- Concurrency check: If already in 'processing' within the last 2 minutes, avoid parallel race
+    -- 5. Case C: In-flight processing lock (processing started within last 2 minutes)
     IF v_existing.status = 'processing' AND v_existing.last_attempt > (v_now - INTERVAL '2 minutes') THEN
         RETURN jsonb_build_object(
             'should_process', false,
@@ -705,7 +915,7 @@ BEGIN
         );
     END IF;
 
-    -- Safe retry: If previous attempt failed (or timed out in 'processing' > 2 minutes)
+    -- 6. Case D: Safe retry (failed status OR stale processing timeout > 2 minutes)
     UPDATE public.webhook_events
     SET status = 'processing',
         retry_count = v_existing.retry_count + 1,
@@ -934,3 +1144,141 @@ $$;
 -- Restrict admin_set_user_role: STRICTLY service_role only
 REVOKE EXECUTE ON FUNCTION public.admin_set_user_role(UUID, TEXT) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.admin_set_user_role(UUID, TEXT) TO service_role;
+
+-- ------------------------------------------------------------------------------
+-- RPC 6: publish_assessment_version
+-- Administrative RPC to publish an assessment version, archiving prior versions
+-- and bumping the assessment's current_version pointer
+-- ------------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.publish_assessment_version(
+    p_version_id UUID
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+    v_version RECORD;
+    v_assessment RECORD;
+    v_now TIMESTAMPTZ := timezone('utc'::text, now());
+    v_jwt_role TEXT;
+BEGIN
+    -- Verify caller context is trusted service_role
+    v_jwt_role := COALESCE(
+        current_setting('request.jwt.claim.role', true),
+        (NULLIF(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'),
+        ''
+    );
+
+    IF v_jwt_role IN ('authenticated', 'anon') OR current_user IN ('authenticated', 'anon') THEN
+        RAISE EXCEPTION 'Unauthorized: RPC publish_assessment_version requires trusted service_role privileges.';
+    END IF;
+
+    -- Select and lock target version
+    SELECT * INTO v_version
+    FROM public.assessment_versions
+    WHERE id = p_version_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Assessment version % not found', p_version_id;
+    END IF;
+
+    IF v_version.status = 'published' THEN
+        RETURN jsonb_build_object(
+            'success', true,
+            'already_published', true,
+            'version_id', v_version.id,
+            'version_number', v_version.version_number
+        );
+    END IF;
+
+    IF v_version.status = 'archived' THEN
+        RAISE EXCEPTION 'Cannot publish archived version %', p_version_id;
+    END IF;
+
+    -- Lock parent assessment row
+    SELECT * INTO v_assessment
+    FROM public.assessments
+    WHERE id = v_version.assessment_id
+    FOR UPDATE;
+
+    -- Archive existing published version(s) for this assessment
+    UPDATE public.assessment_versions
+    SET status = 'archived',
+        updated_at = v_now
+    WHERE assessment_id = v_version.assessment_id
+      AND status = 'published'
+      AND id != p_version_id;
+
+    -- Mark target version as published
+    UPDATE public.assessment_versions
+    SET status = 'published',
+        published_at = v_now,
+        updated_at = v_now
+    WHERE id = p_version_id;
+
+    -- Update assessment current_version
+    UPDATE public.assessments
+    SET current_version = v_version.version_number,
+        updated_at = v_now
+    WHERE id = v_version.assessment_id;
+
+    RETURN jsonb_build_object(
+        'success', true,
+        'version_id', v_version.id,
+        'version_number', v_version.version_number,
+        'assessment_id', v_version.assessment_id,
+        'status', 'published'
+    );
+END;
+$$;
+
+-- Restrict publish_assessment_version: STRICTLY service_role only
+REVOKE EXECUTE ON FUNCTION public.publish_assessment_version(UUID) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.publish_assessment_version(UUID) TO service_role;
+
+-- ==============================================================================
+-- 12. EXPLICIT DATABASE PRIVILEGES & ACCESS CONTROL (LEAST PRIVILEGE)
+-- ==============================================================================
+
+-- 12.1 Revoke default schema privileges from PUBLIC
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC;
+REVOKE ALL ON ALL ROUTINES IN SCHEMA public FROM PUBLIC;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM PUBLIC;
+
+-- 12.2 Revoke table privileges from anon and authenticated across all tables
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon, authenticated;
+REVOKE ALL ON ALL ROUTINES IN SCHEMA public FROM anon, authenticated;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM anon, authenticated;
+
+-- 12.3 Explicit SELECT grants on Public Assessment Catalog
+GRANT SELECT ON public.assessments TO anon, authenticated;
+GRANT SELECT ON public.assessment_versions TO anon, authenticated;
+GRANT SELECT ON public.scoring_dimensions TO anon, authenticated;
+GRANT SELECT ON public.questions TO anon, authenticated;
+GRANT SELECT ON public.public_answer_options TO anon, authenticated;
+
+-- 12.4 Answer options: Restrictive column-level grant (dimension_weights omitted)
+GRANT SELECT (id, question_id, order_index, label, value, created_at) ON public.answer_options TO anon, authenticated;
+
+-- 12.5 User Profiles: Authenticated users can view and update their own profiles
+GRANT SELECT, UPDATE ON public.profiles TO authenticated;
+
+-- 12.6 Explicitly verify private business tables have NO privileges granted to anon or authenticated
+REVOKE ALL ON public.orders FROM anon, authenticated;
+REVOKE ALL ON public.payments FROM anon, authenticated;
+REVOKE ALL ON public.reports FROM anon, authenticated;
+REVOKE ALL ON public.report_downloads FROM anon, authenticated;
+REVOKE ALL ON public.webhook_events FROM anon, authenticated;
+REVOKE ALL ON public.admin_rate_limits FROM anon, authenticated;
+REVOKE ALL ON public.assessment_sessions FROM anon, authenticated;
+REVOKE ALL ON public.user_responses FROM anon, authenticated;
+REVOKE ALL ON public.calculated_results FROM anon, authenticated;
+
+-- 12.7 Service Role: Full administrative privileges for trusted server-side operations
+GRANT ALL ON SCHEMA public TO service_role;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO service_role;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO service_role;
+GRANT ALL ON ALL ROUTINES IN SCHEMA public TO service_role;

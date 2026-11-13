@@ -129,6 +129,17 @@ async function runPhase2DatabaseTests() {
   const dupFulfillment = await db.markOrderAsPaid(order.id, paymentId, signature);
   assert(dupFulfillment.report.reportCode === report.reportCode, "2.10: Duplicate payment fulfillment is idempotent");
 
+  // 2.11 Conflicting payment ID on already-paid order throws exception
+  let paymentConflictThrew = false;
+  try {
+    await db.markOrderAsPaid(order.id, "pay_conflicting_fraudulent_attempt_999", signature);
+  } catch (err: any) {
+    if (err.message.includes("Payment conflict") && err.message.includes("already paid")) {
+      paymentConflictThrew = true;
+    }
+  }
+  assert(paymentConflictThrew, "2.11: Repeated fulfillment with conflicting payment ID is strictly rejected");
+
   // ---------------------------------------------------------------------------
   // 3. ACCESS TOKEN CRYPTOGRAPHIC HASHING & PRIVACY
   // ---------------------------------------------------------------------------
@@ -188,6 +199,18 @@ async function runPhase2DatabaseTests() {
   const postProcessedLifecycle = await db.recordWebhookLifecycle(webhookEventId, "payment.captured", { orderId: order.id });
   assert(postProcessedLifecycle.shouldProcess === false, "4.10: Processed event permanently blocks redundant re-processing");
   assert(postProcessedLifecycle.status === "processed", "4.11: Status remains 'processed'");
+
+  // 4.7 Simultaneous first-time requests for the same previously unseen event ID
+  const concurrentEventId = `evt_concurrent_unseen_${runId}`;
+  const [resA, resB] = await Promise.all([
+    db.recordWebhookLifecycle(concurrentEventId, "payment.captured", { orderId: order.id }),
+    db.recordWebhookLifecycle(concurrentEventId, "payment.captured", { orderId: order.id }),
+  ]);
+
+  const winCount = (resA.shouldProcess ? 1 : 0) + (resB.shouldProcess ? 1 : 0);
+  const flightCount = (resA.status === "in_flight" ? 1 : 0) + (resB.status === "in_flight" ? 1 : 0);
+  assert(winCount === 1, "4.12: Exactly one concurrent request wins processing lock for unseen event ID");
+  assert(flightCount === 1, "4.13: Concurrent duplicate request receives in_flight status lock");
 
   // ---------------------------------------------------------------------------
   // 5. ADMINISTRATOR RATE LIMITING & ATOMIC CONCURRENCY
@@ -339,6 +362,150 @@ async function runPhase2DatabaseTests() {
   }
 
   // ---------------------------------------------------------------------------
+  // 7.2 ASSESSMENT-VERSION RELATIONAL INTEGRITY (COMPOSITE FOREIGN KEYS)
+  // ---------------------------------------------------------------------------
+  console.log("\n--- 7.2 ASSESSMENT-VERSION RELATIONAL INTEGRITY ---");
+
+  const memRepo = new InMemoryRepository();
+  const v1Personality = memRepo.createAssessmentVersion({
+    assessmentId: "asm_personality_100",
+    versionNumber: 1,
+    status: "published",
+    changelog: "Personality v1",
+  });
+  const v1Career = memRepo.createAssessmentVersion({
+    assessmentId: "asm_career_200",
+    versionNumber: 1,
+    status: "published",
+    changelog: "Career v1",
+  });
+
+  // Attempt to create session with mismatched assessment_id and version_id
+  let mismatchedSessionThrew = false;
+  try {
+    await memRepo.createSession({
+      assessmentSlug: "personality-archetype",
+      guestSessionToken: "gst_mismatch_cross_assessment",
+      assessmentId: "asm_personality_100",
+      versionId: v1Career.id, // Belonging to Career!
+    });
+  } catch (err: any) {
+    if (err.message.includes("Foreign key violation")) {
+      mismatchedSessionThrew = true;
+    }
+  }
+  assert(mismatchedSessionThrew, "7.2: Session with mismatched assessment_id and version_id rejected by composite FK");
+
+  // Create valid session on v1Personality
+  const validSession = await memRepo.createSession({
+    assessmentSlug: "personality-archetype",
+    guestSessionToken: "gst_valid_session_integrity",
+    assessmentId: "asm_personality_100",
+    versionId: v1Personality.id,
+  });
+  assert(validSession.id.startsWith("sess_"), "7.3: Valid session created with matching assessment_id and version_id");
+
+  // Create draft version and questions to test response-version alignment
+  const draftVersion = memRepo.createAssessmentVersion({
+    assessmentId: "asm_personality_100",
+    versionNumber: 2,
+    status: "draft",
+    changelog: "Personality v2 draft",
+  });
+
+  const qDraft = memRepo.createQuestion({
+    versionId: draftVersion.id,
+    questionCode: "pa_draft_q1",
+    questionText: "How do you recharge after intense work?",
+  });
+
+  // Attempt to save response with question from draftVersion to session running v1Personality
+  let mismatchedResponseThrew = false;
+  try {
+    await memRepo.saveResponses(validSession.id, [
+      { questionId: qDraft.id, numericValue: 4 },
+    ]);
+  } catch (err: any) {
+    if (err.message.includes("Foreign key violation")) {
+      mismatchedResponseThrew = true;
+    }
+  }
+  assert(mismatchedResponseThrew, "7.4: User response with question from mismatched version rejected by composite FK");
+
+  // ---------------------------------------------------------------------------
+  // 7.3 PUBLISHED ASSESSMENT IMMUTABILITY & VERSION PUBLISHING
+  // ---------------------------------------------------------------------------
+  console.log("\n--- 7.3 PUBLISHED ASSESSMENT IMMUTABILITY & VERSION PUBLISHING ---");
+
+  // 7.5 Content editing is allowed on draft versions
+  const updatedDraftQ = memRepo.updateQuestion(qDraft.id, {
+    questionText: "How do you recharge after intense creative work?",
+  });
+  assert(updatedDraftQ.questionText.includes("creative work"), "7.5: Draft assessment version questions can be modified freely");
+
+  const qDraft2 = memRepo.createQuestion({
+    versionId: draftVersion.id,
+    questionCode: "pa_draft_q2",
+    questionText: "Question to delete in draft",
+  });
+  memRepo.deleteQuestion(qDraft2.id);
+  assert(true, "7.6: Draft assessment questions can be deleted freely");
+
+  // 7.7 Published versions reject question creation
+  let publishedInsertThrew = false;
+  try {
+    memRepo.createQuestion({
+      versionId: v1Personality.id, // Published version!
+      questionCode: "pa_v1_illegal_add",
+      questionText: "Illegal question addition to published version",
+    });
+  } catch (err: any) {
+    if (err.message.includes("immutable once published")) {
+      publishedInsertThrew = true;
+    }
+  }
+  assert(publishedInsertThrew, "7.7: Modifying content on published assessment version is strictly blocked by immutability trigger");
+
+  // 7.8 Published version cannot be deleted
+  let publishedDeleteThrew = false;
+  try {
+    memRepo.deleteAssessmentVersion(v1Personality.id);
+  } catch (err: any) {
+    if (err.message.includes("permanently immutable")) {
+      publishedDeleteThrew = true;
+    }
+  }
+  assert(publishedDeleteThrew, "7.8: Published assessment version deletion is strictly blocked for historical integrity");
+
+  // 7.9 Publishing RPC rejects unauthenticated or anon callers
+  let unauthorizedPublishThrew = false;
+  try {
+    await memRepo.publishAssessmentVersion(draftVersion.id, { jwtRole: "authenticated" });
+  } catch (err: any) {
+    if (err.message.includes("Unauthorized") && err.message.includes("service_role")) {
+      unauthorizedPublishThrew = true;
+    }
+  }
+  assert(unauthorizedPublishThrew, "7.9: publish_assessment_version RPC strictly rejects unprivileged callers");
+
+  // 7.10 Publishing RPC by service_role archives prior version and publishes draft
+  const publishResult = await memRepo.publishAssessmentVersion(draftVersion.id, { jwtRole: "service_role" });
+  assert(publishResult.success === true, "7.10: publish_assessment_version RPC succeeds for service_role");
+  assert(publishResult.status === "published", "7.11: Draft version successfully transitioned to published");
+  assert(publishResult.versionNumber === 2, "7.12: Published version number is 2");
+
+  // 7.13 Questions in newly published version are now immutable
+  let nowImmutableThrew = false;
+  try {
+    memRepo.updateQuestion(qDraft.id, { questionText: "Illegal edit post-publication" });
+  } catch (err: any) {
+    if (err.message.includes("immutable once published")) {
+      nowImmutableThrew = true;
+    }
+  }
+  assert(nowImmutableThrew, "7.13: Questions locked and immutable once version is published");
+
+  // ---------------------------------------------------------------------------
   // 8. SQL MIGRATION SECURITY & CONTRACT VERIFICATION
   // ---------------------------------------------------------------------------
   console.log("\n--- 8. SQL MIGRATION SECURITY & CONTRACT VERIFICATION ---");
@@ -473,6 +640,108 @@ async function runPhase2DatabaseTests() {
   assert(
     (sqlContent.match(/EXECUTE FUNCTION public\.set_updated_at\(\)/g) || []).length >= 6,
     "8.21: set_updated_at trigger attached across all mutable entity tables"
+  );
+
+  // 8.5 Webhook Concurrency Serialization
+  assert(
+    sqlContent.includes("INSERT INTO public.webhook_events") &&
+    sqlContent.includes("ON CONFLICT (event_id) DO NOTHING;") &&
+    sqlContent.includes("SELECT * INTO v_existing") &&
+    sqlContent.includes("WHERE event_id = p_event_id") &&
+    sqlContent.includes("FOR UPDATE;"),
+    "8.22: record_webhook_event_idempotent uses atomic ON CONFLICT DO NOTHING and FOR UPDATE lock"
+  );
+
+  // 8.6 Assessment-Version Composite Foreign Keys
+  assert(
+    sqlContent.includes("UNIQUE(id, assessment_id) -- Enables composite foreign key from assessment_sessions"),
+    "8.23: assessment_versions defines UNIQUE(id, assessment_id) for composite foreign key targeting"
+  );
+
+  assert(
+    sqlContent.includes("CONSTRAINT fk_session_assessment_version") &&
+    sqlContent.includes("FOREIGN KEY (version_id, assessment_id)") &&
+    sqlContent.includes("REFERENCES public.assessment_versions(id, assessment_id)"),
+    "8.24: assessment_sessions enforces composite foreign key (version_id, assessment_id)"
+  );
+
+  assert(
+    sqlContent.includes("UNIQUE(id, version_id) -- Enables composite foreign key from user_responses"),
+    "8.25: questions and assessment_sessions define UNIQUE(id, version_id) composite constraints"
+  );
+
+  assert(
+    sqlContent.includes("CONSTRAINT fk_response_session_version") &&
+    sqlContent.includes("FOREIGN KEY (session_id, version_id)") &&
+    sqlContent.includes("REFERENCES public.assessment_sessions(id, version_id)") &&
+    sqlContent.includes("CONSTRAINT fk_response_question_version") &&
+    sqlContent.includes("FOREIGN KEY (question_id, version_id)") &&
+    sqlContent.includes("REFERENCES public.questions(id, version_id)"),
+    "8.26: user_responses enforces composite foreign keys guaranteeing response question matches session version"
+  );
+
+  // 8.7 Published Assessment Immutability Triggers & Publish RPC
+  assert(
+    sqlContent.includes("CREATE OR REPLACE FUNCTION public.enforce_assessment_version_immutability()") &&
+    sqlContent.includes("CREATE TRIGGER trg_assessment_versions_immutability") &&
+    sqlContent.includes("BEFORE UPDATE OR DELETE ON public.assessment_versions"),
+    "8.27: enforce_assessment_version_immutability trigger attached to prevent modifying or deleting published versions"
+  );
+
+  assert(
+    sqlContent.includes("CREATE OR REPLACE FUNCTION public.enforce_assessment_content_immutability()") &&
+    sqlContent.includes("CREATE TRIGGER trg_scoring_dimensions_immutability") &&
+    sqlContent.includes("CREATE TRIGGER trg_questions_immutability") &&
+    sqlContent.includes("CREATE TRIGGER trg_answer_options_immutability"),
+    "8.28: enforce_assessment_content_immutability attached across dimensions, questions, and answer options"
+  );
+
+  assert(
+    sqlContent.includes("CREATE OR REPLACE FUNCTION public.publish_assessment_version") &&
+    sqlContent.includes("REVOKE EXECUTE ON FUNCTION public.publish_assessment_version(UUID) FROM PUBLIC, anon, authenticated;") &&
+    sqlContent.includes("GRANT EXECUTE ON FUNCTION public.publish_assessment_version(UUID) TO service_role;"),
+    "8.29: publish_assessment_version RPC defined, revoked from public callers, granted strictly to service_role"
+  );
+
+  // 8.8 Explicit Database Grants & Least Privilege
+  assert(
+    sqlContent.includes("REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC;") &&
+    sqlContent.includes("REVOKE ALL ON ALL ROUTINES IN SCHEMA public FROM PUBLIC;") &&
+    sqlContent.includes("REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon, authenticated;"),
+    "8.30: Default public schema privileges explicitly revoked from PUBLIC, anon, and authenticated"
+  );
+
+  assert(
+    sqlContent.includes("GRANT SELECT ON public.assessments TO anon, authenticated;") &&
+    sqlContent.includes("GRANT SELECT ON public.assessment_versions TO anon, authenticated;") &&
+    sqlContent.includes("GRANT SELECT ON public.scoring_dimensions TO anon, authenticated;") &&
+    sqlContent.includes("GRANT SELECT ON public.questions TO anon, authenticated;") &&
+    sqlContent.includes("GRANT SELECT ON public.public_answer_options TO anon, authenticated;"),
+    "8.31: Explicit SELECT granted to anon, authenticated strictly on public catalog tables and safe views"
+  );
+
+  assert(
+    sqlContent.includes("REVOKE ALL ON public.orders FROM anon, authenticated;") &&
+    sqlContent.includes("REVOKE ALL ON public.payments FROM anon, authenticated;") &&
+    sqlContent.includes("REVOKE ALL ON public.reports FROM anon, authenticated;") &&
+    sqlContent.includes("REVOKE ALL ON public.webhook_events FROM anon, authenticated;") &&
+    sqlContent.includes("REVOKE ALL ON public.admin_rate_limits FROM anon, authenticated;"),
+    "8.32: Core private business tables explicitly have ALL privileges revoked from anon and authenticated"
+  );
+
+  assert(
+    sqlContent.includes("GRANT ALL ON SCHEMA public TO service_role;") &&
+    sqlContent.includes("GRANT ALL ON ALL TABLES IN SCHEMA public TO service_role;") &&
+    sqlContent.includes("GRANT ALL ON ALL ROUTINES IN SCHEMA public TO service_role;"),
+    "8.33: Trusted service_role granted full administrative privileges for server-side operations"
+  );
+
+  // 8.9 Payment Fulfillment Conflicting ID Detection
+  assert(
+    sqlContent.includes("IF v_order.status = 'paid' THEN") &&
+    sqlContent.includes("v_order.razorpay_payment_id IS NOT NULL AND v_order.razorpay_payment_id != p_payment_id") &&
+    sqlContent.includes("RAISE EXCEPTION 'Payment conflict: Order % is already paid with payment ID %, received conflicting payment ID %'"),
+    "8.34: fulfill_order_payment strictly detects and rejects conflicting payment IDs on paid orders"
   );
 
   // ---------------------------------------------------------------------------

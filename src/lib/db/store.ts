@@ -193,4 +193,15 @@ export const db = {
   ): Promise<ProfileRecord> {
     return getActiveRepo().adminSetUserRole(userId, newRole, callerContext);
   },
+
+  publishAssessmentVersion(
+    versionId: string,
+    callerContext?: { jwtRole?: string }
+  ): Promise<{ success: boolean; versionId: string; versionNumber: number; status: string }> {
+    const repo = getActiveRepo();
+    if (repo.publishAssessmentVersion) {
+      return repo.publishAssessmentVersion(versionId, callerContext);
+    }
+    throw new Error("publishAssessmentVersion not supported on active repository");
+  },
 };

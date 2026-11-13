@@ -81,6 +81,10 @@ export interface DatabaseRepository {
     newRole: ProfileRole,
     callerContext?: { jwtRole?: string }
   ): Promise<ProfileRecord>;
+  publishAssessmentVersion?(
+    versionId: string,
+    callerContext?: { jwtRole?: string }
+  ): Promise<{ success: boolean; versionId: string; versionNumber: number; status: string }>;
 }
 
 // ==============================================================================
@@ -215,7 +219,12 @@ export class SupabasePostgresRepository implements DatabaseRepository {
         p_page_count: 12,
       });
 
-      if (!rpcError && rpcResult?.success) {
+      if (rpcError) {
+        if (rpcError.code !== "PGRST202" && rpcError.code !== "42883") {
+          throw new Error(`Payment fulfillment failed: ${rpcError.message}`);
+        }
+        console.warn("[SupabaseRepository] RPC fulfill_order_payment not installed, falling back:", rpcError);
+      } else if (rpcResult?.success) {
         const updatedOrder = await this.getOrderById(orderId);
         const report = await this.getReportByOrderId(orderId);
         return {
@@ -224,8 +233,22 @@ export class SupabasePostgresRepository implements DatabaseRepository {
           accessToken: plaintextAccessToken,
         };
       }
-    } catch (err) {
+    } catch (err: any) {
+      if (err.message?.startsWith("Payment fulfillment failed:")) throw err;
       console.warn("[SupabaseRepository] RPC fulfill_order_payment fallback:", err);
+    }
+
+    // Verify idempotent already-paid state with conflict check
+    if (order.status === "paid") {
+      if (order.razorpayPaymentId && order.razorpayPaymentId !== paymentId) {
+        throw new Error(
+          `Payment conflict: Order ${orderId} is already paid under payment ID ${order.razorpayPaymentId}, received conflicting payment ID ${paymentId}`
+        );
+      }
+      const existingReport = await this.getReportByOrderId(orderId);
+      if (existingReport) {
+        return { order, report: existingReport, accessToken: order.accessToken || "acc_existing" };
+      }
     }
 
     // Sequential fallback if RPC is not installed
@@ -798,6 +821,31 @@ export class SupabasePostgresRepository implements DatabaseRepository {
     return this.mapProfileFromDb(data);
   }
 
+  async publishAssessmentVersion(
+    versionId: string,
+    callerContext?: { jwtRole?: string }
+  ): Promise<{ success: boolean; versionId: string; versionNumber: number; status: string }> {
+    const jwtRole = callerContext?.jwtRole;
+    if (jwtRole === "authenticated" || jwtRole === "anon") {
+      throw new Error("Unauthorized: RPC publish_assessment_version requires trusted service_role privileges.");
+    }
+
+    const { data, error } = await this.client.rpc("publish_assessment_version", {
+      p_version_id: versionId,
+    });
+
+    if (error) {
+      throw new Error(`Failed to publish assessment version: ${error.message}`);
+    }
+
+    return {
+      success: true,
+      versionId: data.version_id,
+      versionNumber: data.version_number,
+      status: data.status,
+    };
+  }
+
   private mapProfileFromDb(d: any): ProfileRecord {
     return {
       id: d.id,
@@ -837,9 +885,11 @@ export class InMemoryRepository implements DatabaseRepository {
   private webhookEvents = new Map<string, WebhookEventRecord>();
   private adminRateLimits = new Map<string, { attempts: number; firstAttempt: number; lastAttempt: number; lockedUntil?: number }>();
   private sessions = new Map<string, AssessmentSessionRecord>();
-  private responses = new Map<string, Array<{ questionId: string; numericValue: number }>>();
+  private responses = new Map<string, Array<{ questionId: string; numericValue: number; versionId?: string }>>();
   private calculatedResults = new Map<string, AssessmentResult>();
   private profiles = new Map<string, ProfileRecord>();
+  private assessmentVersions = new Map<string, { id: string; assessmentId: string; versionNumber: number; status: "draft" | "published" | "archived"; changelog?: string; publishedAt?: string }>();
+  private questions = new Map<string, { id: string; versionId: string; questionCode: string; questionText: string }>();
 
   async createOrder(data: {
     guestSessionToken: string;
@@ -906,6 +956,18 @@ export class InMemoryRepository implements DatabaseRepository {
   ): Promise<{ order: OrderRecord; report: ReportRecord; accessToken: string }> {
     const order = this.orders.get(orderId);
     if (!order) throw new Error(`Order ${orderId} not found`);
+
+    if (order.status === "paid") {
+      if (order.razorpayPaymentId && order.razorpayPaymentId !== paymentId) {
+        throw new Error(
+          `Payment conflict: Order ${orderId} is already paid under payment ID ${order.razorpayPaymentId}, received conflicting payment ID ${paymentId}`
+        );
+      }
+      const existingReport = Array.from(this.reports.values()).find((r) => r.orderId === orderId);
+      if (existingReport) {
+        return { order, report: existingReport, accessToken: order.accessToken || "acc_existing" };
+      }
+    }
 
     const now = new Date().toISOString();
     order.status = "paid";
@@ -1114,6 +1176,16 @@ export class InMemoryRepository implements DatabaseRepository {
     assessmentId?: string;
     versionId?: string;
   }): Promise<AssessmentSessionRecord> {
+    // Relational integrity check: assessment_id and version_id must match
+    if (data.assessmentId && data.versionId) {
+      const ver = this.assessmentVersions.get(data.versionId);
+      if (ver && ver.assessmentId !== data.assessmentId) {
+        throw new Error(
+          `Foreign key violation: Assessment session assessment_id (${data.assessmentId}) does not match version assessment_id (${ver.assessmentId}).`
+        );
+      }
+    }
+
     const now = new Date().toISOString();
     const id = "sess_" + crypto.randomBytes(8).toString("hex");
     const session: AssessmentSessionRecord = {
@@ -1140,9 +1212,143 @@ export class InMemoryRepository implements DatabaseRepository {
 
   async saveResponses(
     sessionId: string,
-    responses: Array<{ questionId: string; numericValue: number }>
+    responses: Array<{ questionId: string; numericValue: number; versionId?: string }>
   ): Promise<void> {
+    const session = Array.from(this.sessions.values()).find((s) => s.id === sessionId);
+    if (session && session.versionId) {
+      for (const r of responses) {
+        const q = this.questions.get(r.questionId);
+        if (q && q.versionId !== session.versionId) {
+          throw new Error(
+            `Foreign key violation: Response question ${r.questionId} belongs to version ${q.versionId}, but session ${sessionId} is assigned version ${session.versionId}.`
+          );
+        }
+      }
+    }
     this.responses.set(sessionId, responses);
+  }
+
+  createAssessmentVersion(data: {
+    id?: string;
+    assessmentId: string;
+    versionNumber: number;
+    status: "draft" | "published" | "archived";
+    changelog?: string;
+  }) {
+    const id = data.id || "ver_" + crypto.randomBytes(8).toString("hex");
+    const ver = {
+      id,
+      assessmentId: data.assessmentId,
+      versionNumber: data.versionNumber,
+      status: data.status,
+      changelog: data.changelog,
+      publishedAt: data.status === "published" ? new Date().toISOString() : undefined,
+    };
+    this.assessmentVersions.set(id, ver);
+    return ver;
+  }
+
+  updateAssessmentVersion(
+    versionId: string,
+    updates: { assessmentId?: string; versionNumber?: number; status?: "draft" | "published" | "archived"; changelog?: string }
+  ) {
+    const ver = this.assessmentVersions.get(versionId);
+    if (!ver) throw new Error(`Assessment version ${versionId} not found`);
+
+    if (ver.status === "published" || ver.status === "archived") {
+      if (updates.assessmentId && updates.assessmentId !== ver.assessmentId) {
+        throw new Error(`Cannot change assessment_id of ${ver.status} version`);
+      }
+      if (updates.versionNumber && updates.versionNumber !== ver.versionNumber) {
+        throw new Error(`Cannot change version_number of ${ver.status} version`);
+      }
+      if (updates.status === "draft") {
+        throw new Error(`Cannot revert ${ver.status} assessment version back to draft`);
+      }
+      if (ver.status === "archived" && updates.status && updates.status !== "archived") {
+        throw new Error("Cannot modify status of archived assessment version");
+      }
+    }
+
+    if (updates.status) ver.status = updates.status;
+    if (updates.changelog) ver.changelog = updates.changelog;
+    return ver;
+  }
+
+  deleteAssessmentVersion(versionId: string) {
+    const ver = this.assessmentVersions.get(versionId);
+    if (!ver) throw new Error(`Assessment version ${versionId} not found`);
+    if (ver.status === "published" || ver.status === "archived") {
+      throw new Error(`Cannot delete ${ver.status} assessment version. Published and archived versions are permanently immutable.`);
+    }
+    this.assessmentVersions.delete(versionId);
+  }
+
+  createQuestion(data: { id?: string; versionId: string; questionCode: string; questionText: string }) {
+    const ver = this.assessmentVersions.get(data.versionId);
+    if (ver && (ver.status === "published" || ver.status === "archived")) {
+      throw new Error(`Cannot insert question on ${ver.status} assessment version. Content is immutable once published.`);
+    }
+    const id = data.id || "q_" + crypto.randomBytes(8).toString("hex");
+    const q = { id, versionId: data.versionId, questionCode: data.questionCode, questionText: data.questionText };
+    this.questions.set(id, q);
+    return q;
+  }
+
+  updateQuestion(questionId: string, updates: { questionText?: string }) {
+    const q = this.questions.get(questionId);
+    if (!q) throw new Error(`Question ${questionId} not found`);
+    const ver = this.assessmentVersions.get(q.versionId);
+    if (ver && (ver.status === "published" || ver.status === "archived")) {
+      throw new Error(`Cannot update question on ${ver.status} assessment version. Content is immutable once published.`);
+    }
+    if (updates.questionText) q.questionText = updates.questionText;
+    return q;
+  }
+
+  deleteQuestion(questionId: string) {
+    const q = this.questions.get(questionId);
+    if (!q) throw new Error(`Question ${questionId} not found`);
+    const ver = this.assessmentVersions.get(q.versionId);
+    if (ver && (ver.status === "published" || ver.status === "archived")) {
+      throw new Error(`Cannot delete question on ${ver.status} assessment version. Content is immutable once published.`);
+    }
+    this.questions.delete(questionId);
+  }
+
+  async publishAssessmentVersion(
+    versionId: string,
+    callerContext?: { jwtRole?: string }
+  ): Promise<{ success: boolean; versionId: string; versionNumber: number; status: string }> {
+    const jwtRole = callerContext?.jwtRole;
+    if (jwtRole === "authenticated" || jwtRole === "anon") {
+      throw new Error("Unauthorized: RPC publish_assessment_version requires trusted service_role privileges.");
+    }
+    const ver = this.assessmentVersions.get(versionId);
+    if (!ver) throw new Error(`Assessment version ${versionId} not found`);
+    if (ver.status === "published") {
+      return { success: true, versionId: ver.id, versionNumber: ver.versionNumber, status: "published" };
+    }
+    if (ver.status === "archived") {
+      throw new Error(`Cannot publish archived version ${versionId}`);
+    }
+
+    // Archive previous published version for this assessment
+    for (const v of this.assessmentVersions.values()) {
+      if (v.assessmentId === ver.assessmentId && v.status === "published" && v.id !== versionId) {
+        v.status = "archived";
+      }
+    }
+
+    ver.status = "published";
+    ver.publishedAt = new Date().toISOString();
+
+    return {
+      success: true,
+      versionId: ver.id,
+      versionNumber: ver.versionNumber,
+      status: "published",
+    };
   }
 
   async saveCalculatedResult(sessionId: string, result: AssessmentResult): Promise<void> {
