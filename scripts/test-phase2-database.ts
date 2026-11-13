@@ -8,13 +8,14 @@
  * 4. Webhook lifecycle state machine (received -> processing -> processed / failed)
  * 5. Webhook concurrency lock & safe retry on failure
  * 6. Concurrency-safe atomic administrator rate limiting
- * 7. Production fail-closed security enforcement (no filesystem fallback)
- * 8. SQL Relational Integrity & Immutable Assessment Versions
- * 9. SQL SECURITY DEFINER Privilege Hardening (Revoked from PUBLIC/anon/authenticated)
- * 10. Profile Role Escalation Prevention (Trigger & RLS WITH CHECK)
- * 11. Scoring Weights Confidentiality (Column privilege & View isolation)
- * 12. Draft / Inactive Content Protection
- * 13. Financial Audit Record Immutability (ON DELETE RESTRICT)
+ * 7. Profile role escalation prevention & authorized administrative changes
+ * 8. Production fail-closed security enforcement (no filesystem fallback)
+ * 9. SQL Relational Integrity & Immutable Assessment Versions
+ * 10. SQL SECURITY DEFINER Privilege Hardening (Revoked from PUBLIC/anon/authenticated)
+ * 11. Profile Role Protection Architecture (SECURITY INVOKER, no postgres bypass, no recursive RLS)
+ * 12. Scoring Weights Confidentiality (Column privilege & View isolation)
+ * 13. Draft / Inactive Content Protection
+ * 14. Financial Audit Record Immutability (ON DELETE RESTRICT)
  */
 
 import fs from "fs";
@@ -129,7 +130,7 @@ async function runPhase2DatabaseTests() {
   assert(dupFulfillment.report.reportCode === report.reportCode, "2.10: Duplicate payment fulfillment is idempotent");
 
   // ---------------------------------------------------------------------------
-  // 3. ACCESS TOKEN HASHING & PRIVACY TESTS
+  // 3. ACCESS TOKEN CRYPTOGRAPHIC HASHING & PRIVACY
   // ---------------------------------------------------------------------------
   console.log("\n--- 3. ACCESS TOKEN CRYPTOGRAPHIC HASHING & PRIVACY ---");
 
@@ -189,7 +190,7 @@ async function runPhase2DatabaseTests() {
   assert(postProcessedLifecycle.status === "processed", "4.11: Status remains 'processed'");
 
   // ---------------------------------------------------------------------------
-  // 5. ADMINISTRATOR RATE LIMITING & ATOMIC UPSERT
+  // 5. ADMINISTRATOR RATE LIMITING & ATOMIC CONCURRENCY
   // ---------------------------------------------------------------------------
   console.log("\n--- 5. ADMINISTRATOR RATE LIMITING & ATOMIC CONCURRENCY ---");
 
@@ -220,9 +221,95 @@ async function runPhase2DatabaseTests() {
   assert(clearedLimit.remainingAttempts === 5, "5.9: Reset attempts back to 5");
 
   // ---------------------------------------------------------------------------
-  // 6. PRODUCTION FAIL-CLOSED SECURITY ENFORCEMENT
+  // 6. PROFILE ROLE ESCALATION & AUTHORIZATION SUITE
   // ---------------------------------------------------------------------------
-  console.log("\n--- 6. PRODUCTION FAIL-CLOSED SECURITY ENFORCEMENT ---");
+  console.log("\n--- 6. PROFILE ROLE ESCALATION & AUTHORIZATION TESTS ---");
+
+  const testUserId = `usr_auth_${runId}`;
+  await db.createProfile({
+    id: testUserId,
+    email: `customer_${runId}@example.com`,
+    fullName: "Ordinary Customer",
+    role: "user",
+  });
+
+  // 6.1 Ordinary authenticated user can update permitted profile fields
+  const updatedProfile = await db.updateProfile(
+    testUserId,
+    { fullName: "Updated Customer Name", avatarUrl: "https://example.com/avatar.png" },
+    { jwtRole: "authenticated", userId: testUserId }
+  );
+  assert(updatedProfile.fullName === "Updated Customer Name", "6.1: Authenticated user successfully updates permitted profile field (fullName)");
+  assert(updatedProfile.role === "user", "6.2: User role remains securely unchanged as 'user'");
+
+  // 6.2 Authenticated user attempting self-promotion to 'admin' is strictly blocked
+  let adminEscalationBlocked = false;
+  try {
+    await db.updateProfile(
+      testUserId,
+      { role: "admin" },
+      { jwtRole: "authenticated", userId: testUserId }
+    );
+  } catch (err: any) {
+    if (err.message.includes("Unauthorized") && err.message.includes("role")) {
+      adminEscalationBlocked = true;
+    }
+  }
+  assert(adminEscalationBlocked, "6.3: Authenticated user attempting self-promotion to 'admin' is strictly blocked");
+
+  // 6.3 Authenticated user attempting self-promotion to 'super_admin' is strictly blocked
+  let superAdminEscalationBlocked = false;
+  try {
+    await db.updateProfile(
+      testUserId,
+      { role: "super_admin" },
+      { jwtRole: "authenticated", userId: testUserId }
+    );
+  } catch (err: any) {
+    if (err.message.includes("Unauthorized") && err.message.includes("role")) {
+      superAdminEscalationBlocked = true;
+    }
+  }
+  assert(superAdminEscalationBlocked, "6.4: Authenticated user attempting self-promotion to 'super_admin' is strictly blocked");
+
+  // 6.4 Cross-user profile tampering is blocked
+  let crossUserBlocked = false;
+  try {
+    await db.updateProfile(
+      testUserId,
+      { fullName: "Attacker Impersonation" },
+      { jwtRole: "authenticated", userId: `victim_${runId}` }
+    );
+  } catch (err: any) {
+    if (err.message.includes("Unauthorized")) {
+      crossUserBlocked = true;
+    }
+  }
+  assert(crossUserBlocked, "6.5: Authenticated user cannot update another user's profile");
+
+  // 6.5 Authenticated user cannot invoke administrative RPC admin_set_user_role
+  let userRpcBlocked = false;
+  try {
+    await db.adminSetUserRole(testUserId, "admin", { jwtRole: "authenticated" });
+  } catch (err: any) {
+    if (err.message.includes("Unauthorized") && err.message.includes("admin_set_user_role")) {
+      userRpcBlocked = true;
+    }
+  }
+  assert(userRpcBlocked, "6.6: Authenticated user denied execution of admin_set_user_role RPC");
+
+  // 6.6 Trusted server-side role (service_role) can perform authorized role change
+  const elevatedProfile = await db.adminSetUserRole(testUserId, "admin", { jwtRole: "service_role" });
+  assert(elevatedProfile.role === "admin", "6.7: Trusted server-side role (service_role) successfully elevates user to 'admin'");
+
+  // 6.7 Trusted server-side role can revert role
+  const revertedProfile = await db.adminSetUserRole(testUserId, "user", { jwtRole: "service_role" });
+  assert(revertedProfile.role === "user", "6.8: Trusted server-side role successfully reverts user to 'user'");
+
+  // ---------------------------------------------------------------------------
+  // 7. PRODUCTION FAIL-CLOSED SECURITY ENFORCEMENT
+  // ---------------------------------------------------------------------------
+  console.log("\n--- 7. PRODUCTION FAIL-CLOSED SECURITY ENFORCEMENT ---");
 
   const origEnv = process.env.NODE_ENV;
   const origUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -245,133 +332,159 @@ async function runPhase2DatabaseTests() {
         threwExpected = true;
       }
     }
-    assert(threwExpected, "6.1: Production mode with missing Supabase configuration fails closed immediately");
+    assert(threwExpected, "7.1: Production mode with missing Supabase configuration fails closed immediately");
   } finally {
     (process.env as any).NODE_ENV = origEnv;
     process.env.NEXT_PUBLIC_SUPABASE_URL = origUrl;
   }
 
   // ---------------------------------------------------------------------------
-  // 7. SQL MIGRATION SECURITY & CONTRACT AUDIT
+  // 8. SQL MIGRATION SECURITY & CONTRACT VERIFICATION
   // ---------------------------------------------------------------------------
-  console.log("\n--- 7. SQL MIGRATION SECURITY & CONTRACT VERIFICATION ---");
+  console.log("\n--- 8. SQL MIGRATION SECURITY & CONTRACT VERIFICATION ---");
 
   const sqlPath = path.join(process.cwd(), "supabase/migrations/20261102_phase2_persistence.sql");
   const sqlContent = fs.readFileSync(sqlPath, "utf-8");
 
-  // 7.1 Restrict SECURITY DEFINER RPC Privileges
+  // 8.1 Restrict SECURITY DEFINER RPC Privileges
   assert(
     sqlContent.includes("REVOKE EXECUTE ON FUNCTION public.fulfill_order_payment") &&
     sqlContent.includes("GRANT EXECUTE ON FUNCTION public.fulfill_order_payment") &&
     sqlContent.includes("TO service_role"),
-    "7.1: fulfill_order_payment revoked from PUBLIC/anon/authenticated and granted strictly to service_role"
+    "8.1: fulfill_order_payment revoked from PUBLIC/anon/authenticated and granted strictly to service_role"
   );
 
   assert(
     sqlContent.includes("REVOKE EXECUTE ON FUNCTION public.record_webhook_event_idempotent") &&
     sqlContent.includes("GRANT EXECUTE ON FUNCTION public.record_webhook_event_idempotent") &&
     sqlContent.includes("TO service_role"),
-    "7.2: record_webhook_event_idempotent revoked from PUBLIC/anon/authenticated and granted strictly to service_role"
+    "8.2: record_webhook_event_idempotent revoked from PUBLIC/anon/authenticated and granted strictly to service_role"
   );
 
   assert(
     sqlContent.includes("REVOKE EXECUTE ON FUNCTION public.finalize_webhook_event") &&
     sqlContent.includes("GRANT EXECUTE ON FUNCTION public.finalize_webhook_event") &&
     sqlContent.includes("TO service_role"),
-    "7.3: finalize_webhook_event revoked from PUBLIC/anon/authenticated and granted strictly to service_role"
+    "8.3: finalize_webhook_event revoked from PUBLIC/anon/authenticated and granted strictly to service_role"
   );
 
   assert(
     sqlContent.includes("REVOKE EXECUTE ON FUNCTION public.check_and_record_admin_attempt") &&
     sqlContent.includes("GRANT EXECUTE ON FUNCTION public.check_and_record_admin_attempt") &&
     sqlContent.includes("TO service_role"),
-    "7.4: check_and_record_admin_attempt revoked from PUBLIC/anon/authenticated and granted strictly to service_role"
+    "8.4: check_and_record_admin_attempt revoked from PUBLIC/anon/authenticated and granted strictly to service_role"
+  );
+
+  assert(
+    sqlContent.includes("CREATE OR REPLACE FUNCTION public.admin_set_user_role") &&
+    sqlContent.includes("REVOKE EXECUTE ON FUNCTION public.admin_set_user_role") &&
+    sqlContent.includes("GRANT EXECUTE ON FUNCTION public.admin_set_user_role(UUID, TEXT) TO service_role"),
+    "8.5: admin_set_user_role revoked from PUBLIC/anon/authenticated and granted strictly to service_role"
   );
 
   assert(
     (sqlContent.match(/SET search_path = public, pg_temp/g) || []).length >= 5,
-    "7.5: Safe search_path = public, pg_temp explicitly configured on all SECURITY DEFINER functions"
+    "8.6: Safe search_path = public, pg_temp explicitly configured on all privileged functions"
   );
 
-  // 7.2 Profile Role Escalation Prevention
+  // 8.2 Profile Role Escalation Prevention Architecture
+  // Check 1: Trigger function is declared as SECURITY INVOKER (NOT SECURITY DEFINER)
+  const triggerFuncMatch = sqlContent.match(/CREATE OR REPLACE FUNCTION public\.prevent_profile_role_escalation\(\)[\s\S]*?\$\$[\s\S]*?BEGIN/);
   assert(
-    sqlContent.includes("prevent_profile_role_escalation") &&
-    sqlContent.includes("trg_prevent_profile_role_escalation") &&
-    sqlContent.includes("BEFORE UPDATE ON public.profiles"),
-    "7.6: trg_prevent_profile_role_escalation trigger installed to block self-elevation"
+    Boolean(triggerFuncMatch && !triggerFuncMatch[0].includes("SECURITY DEFINER")),
+    "8.7: prevent_profile_role_escalation is declared as SECURITY INVOKER (omits SECURITY DEFINER) to preserve caller identity"
+  );
+
+  // Check 2: Flawed 'current_user != postgres' check is completely eliminated
+  assert(
+    !sqlContent.includes("current_user != 'postgres'"),
+    "8.8: Flawed 'current_user != postgres' check is completely eliminated from SQL migration"
+  );
+
+  // Check 3: Trigger checks both PostgREST JWT claim role and database session role
+  assert(
+    sqlContent.includes("v_jwt_role IN ('authenticated', 'anon')") &&
+    sqlContent.includes("current_user IN ('authenticated', 'anon')"),
+    "8.9: Trigger strictly blocks both HTTP JWT roles and DB session roles of authenticated and anon"
+  );
+
+  // Check 4: RLS policy does NOT query public.profiles recursively
+  assert(
+    !sqlContent.includes("role = (SELECT p.role FROM public.profiles"),
+    "8.10: Profiles RLS policy eliminates self-referencing subqueries (recursive RLS evaluation prevented)"
   );
 
   assert(
-    sqlContent.includes("WITH CHECK (") &&
-    sqlContent.includes("role = (SELECT p.role FROM public.profiles p WHERE p.id = auth.uid())"),
-    "7.7: Profiles UPDATE RLS policy includes WITH CHECK constraint to prevent role tampering"
+    sqlContent.includes("CREATE POLICY \"Users update own profile\" ON public.profiles") &&
+    sqlContent.includes("WITH CHECK (auth.uid() = id);"),
+    "8.11: Profiles UPDATE RLS policy enforces non-recursive WITH CHECK (auth.uid() = id)"
   );
 
-  // 7.3 Scoring Weights Confidentiality & Draft Content Protection
+  // 8.3 Scoring Weights Confidentiality & Draft Content Protection
   assert(
     sqlContent.includes("REVOKE SELECT ON public.answer_options FROM PUBLIC, anon, authenticated;") &&
     sqlContent.includes("GRANT SELECT (id, question_id, order_index, label, value, created_at) ON public.answer_options TO anon, authenticated;"),
-    "7.8: answer_options.dimension_weights revoked from anonymous and public clients"
+    "8.12: answer_options.dimension_weights revoked from anonymous and public clients"
   );
 
   assert(
     sqlContent.includes("CREATE OR REPLACE VIEW public.public_answer_options"),
-    "7.9: public_answer_options view provided with dimension_weights omitted"
+    "8.13: public_answer_options view provided with dimension_weights omitted"
   );
 
   assert(
     sqlContent.includes("status = 'published'") &&
     sqlContent.includes("is_active = true"),
-    "7.10: Public RLS policies strictly filter for is_active = true and status = 'published' (drafts hidden)"
+    "8.14: Public RLS policies strictly filter for is_active = true and status = 'published' (drafts hidden)"
   );
 
-  // 7.4 Relational Integrity & Immutable Versions
+  // 8.4 Relational Integrity & Immutable Versions
   assert(
     sqlContent.includes("CREATE TABLE IF NOT EXISTS public.assessment_versions") &&
     sqlContent.includes("UNIQUE(assessment_id, version_number)"),
-    "7.11: assessment_versions table created with UNIQUE(assessment_id, version_number)"
+    "8.15: assessment_versions table created with UNIQUE(assessment_id, version_number)"
   );
 
   assert(
     sqlContent.includes("version_id UUID NOT NULL REFERENCES public.assessment_versions(id) ON DELETE CASCADE"),
-    "7.12: scoring_dimensions and questions tied to immutable assessment_versions"
+    "8.16: scoring_dimensions and questions tied to immutable assessment_versions"
   );
 
   assert(
     sqlContent.includes("question_id UUID NOT NULL REFERENCES public.questions(id) ON DELETE CASCADE"),
-    "7.13: user_responses.question_id matches questions.id type (UUID) with active foreign key"
+    "8.17: user_responses.question_id matches questions.id type (UUID) with active foreign key"
   );
 
   assert(
     sqlContent.includes("order_id TEXT NOT NULL REFERENCES public.orders(id) ON DELETE RESTRICT"),
-    "7.14: payments.order_id foreign key enforces ON DELETE RESTRICT (financial audit immutability)"
+    "8.18: payments.order_id foreign key enforces ON DELETE RESTRICT (financial audit immutability)"
   );
 
   assert(
     sqlContent.includes("status TEXT NOT NULL DEFAULT 'received' CHECK (status IN ('received', 'processing', 'processed', 'failed'))"),
-    "7.15: webhook_events table defines explicit lifecycle status column with check constraint"
+    "8.19: webhook_events table defines explicit lifecycle status column with check constraint"
   );
 
   assert(
     sqlContent.includes("ON CONFLICT (ip) DO UPDATE SET"),
-    "7.16: admin_rate_limits uses concurrency-safe atomic UPSERT with row-locking"
+    "8.20: admin_rate_limits uses concurrency-safe atomic UPSERT with row-locking"
   );
 
   assert(
     (sqlContent.match(/EXECUTE FUNCTION public\.set_updated_at\(\)/g) || []).length >= 6,
-    "7.17: set_updated_at trigger attached across all mutable entity tables"
+    "8.21: set_updated_at trigger attached across all mutable entity tables"
   );
 
   // ---------------------------------------------------------------------------
-  // 8. HOSTED VS MOCKED TEST DISTINCTION
+  // 9. HOSTED VS MOCKED TEST DISTINCTION
   // ---------------------------------------------------------------------------
-  console.log("\n--- 8. HOSTED DATABASE STATUS & SCOPE BOUNDARIES ---");
+  console.log("\n--- 9. HOSTED DATABASE STATUS & SCOPE BOUNDARIES ---");
   if (remoteConfigured) {
     console.log("   ✅ Hosted Supabase Project (InnerAtlas-dev) is configured.");
   } else {
     console.log("   ⚠️  Hosted Supabase Project (InnerAtlas-dev) execution is intentionally deferred.");
     console.log("      As instructed, migration execution against hosted Supabase awaits product owner review.");
-    console.log("      All 17 static SQL security invariants and repository lifecycle contracts passed cleanly.");
+    console.log("      All 21 static SQL security invariants and repository lifecycle contracts passed cleanly.");
   }
 
   console.log("\n==================================================================");

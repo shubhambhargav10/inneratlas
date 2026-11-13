@@ -25,22 +25,48 @@ END;
 $$;
 
 -- Prevent non-service-role users from escalating profile role
+-- Declared as SECURITY INVOKER (omitting SECURITY DEFINER) so that current_user reflects
+-- the actual caller session role rather than switching to the function owner (postgres).
 CREATE OR REPLACE FUNCTION public.prevent_profile_role_escalation()
 RETURNS TRIGGER
 LANGUAGE plpgsql
-SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
+DECLARE
+    v_jwt_role TEXT;
 BEGIN
-    -- Only service_role or database superuser may alter the role column
-    IF (NEW.role IS DISTINCT FROM OLD.role) THEN
-        IF current_user != 'service_role' 
-           AND current_user != 'postgres' 
-           AND COALESCE(current_setting('request.jwt.claim.role', true), '') != 'service_role' THEN
-            RAISE EXCEPTION 'Unauthorized: Users cannot modify their own profile role or privileges.';
-        END IF;
+    -- 1. If role is not being modified, allow update immediately
+    IF (NEW.role IS NOT DISTINCT FROM OLD.role) THEN
+        RETURN NEW;
     END IF;
-    RETURN NEW;
+
+    -- 2. Role is being modified. Extract PostgREST JWT claim if invoked over HTTP API
+    v_jwt_role := COALESCE(
+        current_setting('request.jwt.claim.role', true),
+        (NULLIF(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'),
+        ''
+    );
+
+    -- 3. Explicitly block HTTP callers with authenticated or anon JWTs
+    IF v_jwt_role IN ('authenticated', 'anon') THEN
+        RAISE EXCEPTION 'Unauthorized: Users cannot modify their own profile role or privileges (JWT role: %).', v_jwt_role;
+    END IF;
+
+    -- 4. Explicitly block database sessions operating under authenticated or anon roles
+    IF current_user IN ('authenticated', 'anon') THEN
+        RAISE EXCEPTION 'Unauthorized: Role % cannot modify profile roles.', current_user;
+    END IF;
+
+    -- 5. Only permit role updates when:
+    --    a) The request carries a verified service_role JWT, OR
+    --    b) The database session role is service_role, postgres, or supabase_admin (with no untrusted user JWT)
+    IF v_jwt_role = 'service_role'
+       OR (v_jwt_role = '' AND current_user IN ('service_role', 'postgres', 'supabase_admin')) THEN
+        RETURN NEW;
+    END IF;
+
+    -- 6. Fail closed for all other execution contexts
+    RAISE EXCEPTION 'Unauthorized: Profile role modifications require trusted server-side administrative privileges.';
 END;
 $$;
 
@@ -450,18 +476,18 @@ SELECT
     created_at
 FROM public.answer_options;
 
--- 10.3 Profile Role Escalation Prevention in RLS
+-- 10.3 Profile Role Protection in RLS (Non-recursive: delegates column immutability to trigger)
 CREATE POLICY "Users read own profile" ON public.profiles
     FOR SELECT TO authenticated
     USING (auth.uid() = id);
 
+-- Authenticated users may update only their own row.
+-- Role modification is intercepted and rejected by trg_prevent_profile_role_escalation.
+-- Note: Self-referencing subqueries against public.profiles are avoided to prevent recursive RLS evaluation.
 CREATE POLICY "Users update own profile" ON public.profiles
     FOR UPDATE TO authenticated
     USING (auth.uid() = id)
-    WITH CHECK (
-        auth.uid() = id
-        AND role = (SELECT p.role FROM public.profiles p WHERE p.id = auth.uid())
-    );
+    WITH CHECK (auth.uid() = id);
 
 -- 10.4 Private Tables: STRICT DEFAULT DENY for Anonymous and Public Access
 -- All order queries, payments, reports, and rate limits MUST use service_role client on server
@@ -853,3 +879,58 @@ $$;
 -- Restrict check_and_record_admin_attempt: ONLY service_role can execute
 REVOKE EXECUTE ON FUNCTION public.check_and_record_admin_attempt(TEXT, BOOLEAN) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.check_and_record_admin_attempt(TEXT, BOOLEAN) TO service_role;
+
+-- ------------------------------------------------------------------------------
+-- RPC 5: admin_set_user_role
+-- Trusted server-side administrative operation for setting profile roles
+-- ------------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.admin_set_user_role(
+    p_user_id UUID,
+    p_new_role TEXT
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+    v_jwt_role TEXT;
+    v_updated RECORD;
+BEGIN
+    -- Verify caller context is trusted service_role
+    v_jwt_role := COALESCE(
+        current_setting('request.jwt.claim.role', true),
+        (NULLIF(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'),
+        ''
+    );
+
+    IF v_jwt_role IN ('authenticated', 'anon') OR current_user IN ('authenticated', 'anon') THEN
+        RAISE EXCEPTION 'Unauthorized: RPC admin_set_user_role requires trusted service_role privileges.';
+    END IF;
+
+    IF p_new_role NOT IN ('user', 'admin', 'super_admin') THEN
+        RAISE EXCEPTION 'Invalid role: %. Permitted values: user, admin, super_admin', p_new_role;
+    END IF;
+
+    UPDATE public.profiles
+    SET role = p_new_role,
+        updated_at = timezone('utc'::text, now())
+    WHERE id = p_user_id
+    RETURNING * INTO v_updated;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'User profile % not found', p_user_id;
+    END IF;
+
+    RETURN jsonb_build_object(
+        'success', true,
+        'user_id', v_updated.id,
+        'email', v_updated.email,
+        'new_role', v_updated.role
+    );
+END;
+$$;
+
+-- Restrict admin_set_user_role: STRICTLY service_role only
+REVOKE EXECUTE ON FUNCTION public.admin_set_user_role(UUID, TEXT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.admin_set_user_role(UUID, TEXT) TO service_role;

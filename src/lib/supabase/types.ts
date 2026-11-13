@@ -2,6 +2,18 @@ import { AssessmentResult } from "@/data/assessments/types";
 
 export type OrderStatus = "created" | "processing" | "paid" | "failed" | "refunded";
 
+export type ProfileRole = "user" | "admin" | "super_admin";
+
+export interface ProfileRecord {
+  id: string;
+  email: string;
+  fullName?: string;
+  avatarUrl?: string;
+  role: ProfileRole;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface OrderRecord {
   id: string;
   orderNumber: string;

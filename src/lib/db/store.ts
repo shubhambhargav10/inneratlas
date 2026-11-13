@@ -10,10 +10,12 @@ import {
   ReportRecord,
   OrderStatus,
   AssessmentSessionRecord,
+  ProfileRecord,
+  ProfileRole,
 } from "@/lib/supabase/types";
 import { AssessmentResult } from "@/data/assessments/types";
 
-export type { OrderRecord, ReportRecord, OrderStatus, AssessmentSessionRecord };
+export type { OrderRecord, ReportRecord, OrderStatus, AssessmentSessionRecord, ProfileRecord, ProfileRole };
 export { hashAccessToken };
 
 let postgresRepoInstance: SupabasePostgresRepository | null = null;
@@ -166,5 +168,29 @@ export const db = {
 
   saveCalculatedResult(sessionId: string, result: AssessmentResult): Promise<void> {
     return getActiveRepo().saveCalculatedResult(sessionId, result);
+  },
+
+  getProfile(userId: string): Promise<ProfileRecord | null> {
+    return getActiveRepo().getProfile(userId);
+  },
+
+  createProfile(data: { id: string; email: string; fullName?: string; avatarUrl?: string; role?: ProfileRole }): Promise<ProfileRecord> {
+    return getActiveRepo().createProfile(data);
+  },
+
+  updateProfile(
+    userId: string,
+    updates: { fullName?: string; avatarUrl?: string; role?: ProfileRole },
+    callerContext?: { jwtRole?: string; userId?: string }
+  ): Promise<ProfileRecord> {
+    return getActiveRepo().updateProfile(userId, updates, callerContext);
+  },
+
+  adminSetUserRole(
+    userId: string,
+    newRole: ProfileRole,
+    callerContext?: { jwtRole?: string }
+  ): Promise<ProfileRecord> {
+    return getActiveRepo().adminSetUserRole(userId, newRole, callerContext);
   },
 };

@@ -9,6 +9,8 @@ import {
   WebhookEventStatus,
   WebhookProcessingResult,
   AdminRateLimitRecord,
+  ProfileRecord,
+  ProfileRole,
 } from "./types";
 import { AssessmentResult } from "@/data/assessments/types";
 
@@ -66,6 +68,19 @@ export interface DatabaseRepository {
   getSession(guestSessionToken: string): Promise<AssessmentSessionRecord | null>;
   saveResponses(sessionId: string, responses: Array<{ questionId: string; numericValue: number }>): Promise<void>;
   saveCalculatedResult(sessionId: string, result: AssessmentResult): Promise<void>;
+
+  getProfile(userId: string): Promise<ProfileRecord | null>;
+  createProfile(data: { id: string; email: string; fullName?: string; avatarUrl?: string; role?: ProfileRole }): Promise<ProfileRecord>;
+  updateProfile(
+    userId: string,
+    updates: { fullName?: string; avatarUrl?: string; role?: ProfileRole },
+    callerContext?: { jwtRole?: string; userId?: string }
+  ): Promise<ProfileRecord>;
+  adminSetUserRole(
+    userId: string,
+    newRole: ProfileRole,
+    callerContext?: { jwtRole?: string }
+  ): Promise<ProfileRecord>;
 }
 
 // ==============================================================================
@@ -676,6 +691,125 @@ export class SupabasePostgresRepository implements DatabaseRepository {
     };
   }
 
+  async getProfile(userId: string): Promise<ProfileRecord | null> {
+    const { data, error } = await this.client
+      .from("profiles")
+      .select("*")
+      .eq("id", userId)
+      .maybeSingle();
+
+    if (error || !data) return null;
+    return this.mapProfileFromDb(data);
+  }
+
+  async createProfile(data: {
+    id: string;
+    email: string;
+    fullName?: string;
+    avatarUrl?: string;
+    role?: ProfileRole;
+  }): Promise<ProfileRecord> {
+    const now = new Date().toISOString();
+    const { data: inserted, error } = await this.client
+      .from("profiles")
+      .insert({
+        id: data.id,
+        email: data.email,
+        full_name: data.fullName || null,
+        avatar_url: data.avatarUrl || null,
+        role: data.role || "user",
+        created_at: now,
+        updated_at: now,
+      })
+      .select()
+      .single();
+
+    if (error || !inserted) {
+      throw new Error(`Failed to create profile: ${error?.message}`);
+    }
+    return this.mapProfileFromDb(inserted);
+  }
+
+  async updateProfile(
+    userId: string,
+    updates: { fullName?: string; avatarUrl?: string; role?: ProfileRole },
+    callerContext?: { jwtRole?: string; userId?: string }
+  ): Promise<ProfileRecord> {
+    // 1. If caller is an ordinary user attempting to touch role, fail immediately
+    if (callerContext?.jwtRole === "authenticated") {
+      if (callerContext.userId && callerContext.userId !== userId) {
+        throw new Error("Unauthorized: Users cannot modify another user's profile.");
+      }
+      if (updates.role) {
+        throw new Error("Unauthorized: Users cannot modify their own profile role or privileges (JWT role: authenticated).");
+      }
+    }
+
+    const payload: any = { updated_at: new Date().toISOString() };
+    if (updates.fullName !== undefined) payload.full_name = updates.fullName;
+    if (updates.avatarUrl !== undefined) payload.avatar_url = updates.avatarUrl;
+    if (updates.role !== undefined) payload.role = updates.role;
+
+    const { data, error } = await this.client
+      .from("profiles")
+      .update(payload)
+      .eq("id", userId)
+      .select()
+      .single();
+
+    if (error || !data) {
+      throw new Error(`Failed to update profile: ${error?.message}`);
+    }
+    return this.mapProfileFromDb(data);
+  }
+
+  async adminSetUserRole(
+    userId: string,
+    newRole: ProfileRole,
+    callerContext?: { jwtRole?: string }
+  ): Promise<ProfileRecord> {
+    if (callerContext?.jwtRole === "authenticated" || callerContext?.jwtRole === "anon") {
+      throw new Error("Unauthorized: RPC admin_set_user_role requires trusted service_role privileges.");
+    }
+
+    try {
+      const { data: rpcRes, error: rpcErr } = await this.client.rpc("admin_set_user_role", {
+        p_user_id: userId,
+        p_new_role: newRole,
+      });
+      if (!rpcErr && rpcRes?.success) {
+        const prof = await this.getProfile(userId);
+        return prof!;
+      }
+    } catch {
+      // Fallback
+    }
+
+    const { data, error } = await this.client
+      .from("profiles")
+      .update({ role: newRole, updated_at: new Date().toISOString() })
+      .eq("id", userId)
+      .select()
+      .single();
+
+    if (error || !data) {
+      throw new Error(`Failed to set user role: ${error?.message}`);
+    }
+    return this.mapProfileFromDb(data);
+  }
+
+  private mapProfileFromDb(d: any): ProfileRecord {
+    return {
+      id: d.id,
+      email: d.email,
+      fullName: d.full_name,
+      avatarUrl: d.avatar_url,
+      role: d.role as ProfileRole,
+      createdAt: d.created_at,
+      updatedAt: d.updated_at,
+    };
+  }
+
   private mapReportFromDb(d: any): ReportRecord {
     return {
       id: d.id,
@@ -705,6 +839,7 @@ export class InMemoryRepository implements DatabaseRepository {
   private sessions = new Map<string, AssessmentSessionRecord>();
   private responses = new Map<string, Array<{ questionId: string; numericValue: number }>>();
   private calculatedResults = new Map<string, AssessmentResult>();
+  private profiles = new Map<string, ProfileRecord>();
 
   async createOrder(data: {
     guestSessionToken: string;
@@ -1012,5 +1147,80 @@ export class InMemoryRepository implements DatabaseRepository {
 
   async saveCalculatedResult(sessionId: string, result: AssessmentResult): Promise<void> {
     this.calculatedResults.set(sessionId, result);
+  }
+
+  async getProfile(userId: string): Promise<ProfileRecord | null> {
+    return this.profiles.get(userId) || null;
+  }
+
+  async createProfile(data: {
+    id: string;
+    email: string;
+    fullName?: string;
+    avatarUrl?: string;
+    role?: ProfileRole;
+  }): Promise<ProfileRecord> {
+    const now = new Date().toISOString();
+    const prof: ProfileRecord = {
+      id: data.id,
+      email: data.email,
+      fullName: data.fullName,
+      avatarUrl: data.avatarUrl,
+      role: data.role || "user",
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.profiles.set(data.id, prof);
+    return prof;
+  }
+
+  async updateProfile(
+    userId: string,
+    updates: { fullName?: string; avatarUrl?: string; role?: ProfileRole },
+    callerContext?: { jwtRole?: string; userId?: string }
+  ): Promise<ProfileRecord> {
+    const existing = this.profiles.get(userId);
+    if (!existing) {
+      throw new Error(`Profile ${userId} not found`);
+    }
+
+    // Role escalation protection check
+    if (callerContext?.jwtRole === "authenticated") {
+      if (callerContext.userId && callerContext.userId !== userId) {
+        throw new Error("Unauthorized: Users cannot modify another user's profile.");
+      }
+      if (updates.role && updates.role !== existing.role) {
+        throw new Error("Unauthorized: Users cannot modify their own profile role or privileges (JWT role: authenticated).");
+      }
+    }
+
+    const now = new Date().toISOString();
+    if (updates.fullName !== undefined) existing.fullName = updates.fullName;
+    if (updates.avatarUrl !== undefined) existing.avatarUrl = updates.avatarUrl;
+    if (updates.role !== undefined && (!callerContext || callerContext.jwtRole === "service_role")) {
+      existing.role = updates.role;
+    }
+    existing.updatedAt = now;
+
+    return existing;
+  }
+
+  async adminSetUserRole(
+    userId: string,
+    newRole: ProfileRole,
+    callerContext?: { jwtRole?: string }
+  ): Promise<ProfileRecord> {
+    if (callerContext?.jwtRole === "authenticated" || callerContext?.jwtRole === "anon") {
+      throw new Error("Unauthorized: RPC admin_set_user_role requires trusted service_role privileges.");
+    }
+
+    const existing = this.profiles.get(userId);
+    if (!existing) {
+      throw new Error(`Profile ${userId} not found`);
+    }
+
+    existing.role = newRole;
+    existing.updatedAt = new Date().toISOString();
+    return existing;
   }
 }
