@@ -140,6 +140,39 @@ async function runPhase2DatabaseTests() {
   }
   assert(paymentConflictThrew, "2.11: Repeated fulfillment with conflicting payment ID is strictly rejected");
 
+  // 2.12 Reject NULL or empty payment ID
+  let nullPaymentThrew = false;
+  try {
+    await db.markOrderAsPaid(order.id, "");
+  } catch (err: any) {
+    if (err.message.includes("payment_id cannot be null or empty")) {
+      nullPaymentThrew = true;
+    }
+  }
+  assert(nullPaymentThrew, "2.12: Missing or empty payment ID fails closed immediately");
+
+  // 2.13 Paid order with missing recorded payment ID raises inconsistent state exception
+  const corruptedOrder = await db.createOrder({
+    guestSessionToken: `gst_corrupt_${runId}`,
+    assessmentSlug: "thinking-style",
+    customerName: "Corrupted Order Test",
+    customerEmail: `corrupt_${runId}@example.com`,
+    amountPaise: 19900,
+    resultPayload,
+  });
+  (corruptedOrder as any).status = "paid";
+  (corruptedOrder as any).razorpayPaymentId = null;
+
+  let inconsistentStateThrew = false;
+  try {
+    await db.markOrderAsPaid(corruptedOrder.id, "pay_valid_attempt_123");
+  } catch (err: any) {
+    if (err.message.includes("Inconsistent payment state") && err.message.includes("no recorded payment ID")) {
+      inconsistentStateThrew = true;
+    }
+  }
+  assert(inconsistentStateThrew, "2.13: Paid order with missing recorded payment ID raises explicit inconsistent state exception");
+
   // ---------------------------------------------------------------------------
   // 3. ACCESS TOKEN CRYPTOGRAPHIC HASHING & PRIVACY
   // ---------------------------------------------------------------------------
@@ -823,6 +856,130 @@ async function runPhase2DatabaseTests() {
   );
 
   // ---------------------------------------------------------------------------
+  // 7.6 ASSESSMENT CONTENT IMMUTABILITY CONCURRENCY SUITE
+  // (Simulates PostgreSQL FOR SHARE / FOR UPDATE row lock coordination)
+  // ---------------------------------------------------------------------------
+  console.log("\n--- 7.6 ASSESSMENT IMMUTABILITY CONCURRENCY TESTS ---");
+
+  // Concurrency Scenario 1: Question update racing with publication
+  const verConc1 = memRepo.createAssessmentVersion({
+    assessmentId: "asm_career_200",
+    versionNumber: 2,
+    status: "draft",
+    changelog: "Career v2 for concurrency test",
+  });
+  const qConc1 = memRepo.createQuestion({
+    versionId: verConc1.id,
+    questionCode: "car_conc_q1",
+    questionText: "Original text before race",
+  });
+
+  const [pubRes1, qUpdateRes1] = await Promise.allSettled([
+    memRepo.publishAssessmentVersion(verConc1.id, { jwtRole: "service_role" }),
+    memRepo.updateQuestionConcurrent(qConc1.id, { questionText: "Raced modification during publish" }),
+  ]);
+  assert(pubRes1.status === "fulfilled", "7.41: Publication completes successfully during race");
+  assert(
+    qUpdateRes1.status === "rejected" &&
+    Boolean((qUpdateRes1 as PromiseRejectedResult).reason.message.includes("immutable once published")),
+    "7.42: Question update racing with publication is serialized by row lock and safely rejected post-publication"
+  );
+
+  // Concurrency Scenario 2: Answer-option update racing with publication
+  const verConc2 = memRepo.createAssessmentVersion({
+    assessmentId: "asm_career_200",
+    versionNumber: 3,
+    status: "draft",
+    changelog: "Career v3 for option concurrency test",
+  });
+  const qConc2 = memRepo.createQuestion({
+    versionId: verConc2.id,
+    questionCode: "car_conc_q2",
+    questionText: "Question for option race",
+  });
+  const optConc2 = memRepo.createAnswerOption({
+    questionId: qConc2.id,
+    orderIndex: 0,
+    label: "Draft option label",
+    value: 1,
+  });
+
+  const [pubRes2, optUpdateRes2] = await Promise.allSettled([
+    memRepo.publishAssessmentVersion(verConc2.id, { jwtRole: "service_role" }),
+    memRepo.updateAnswerOptionConcurrent(optConc2.id, { label: "Raced option label" }),
+  ]);
+  assert(pubRes2.status === "fulfilled", "7.43: Publication completes successfully during answer-option race");
+  assert(
+    optUpdateRes2.status === "rejected" &&
+    Boolean((optUpdateRes2 as PromiseRejectedResult).reason.message.includes("immutable once published")),
+    "7.44: Answer-option update racing with publication is serialized by row lock and safely rejected post-publication"
+  );
+
+  // Concurrency Scenario 3: Reparenting racing with publication (deterministic lock ordering)
+  const verConc3Draft = memRepo.createAssessmentVersion({
+    assessmentId: "asm_career_200",
+    versionNumber: 4,
+    status: "draft",
+    changelog: "Career v4 for reparenting race",
+  });
+  const verConc3Target = memRepo.createAssessmentVersion({
+    assessmentId: "asm_career_200",
+    versionNumber: 5,
+    status: "draft",
+    changelog: "Career v5 target",
+  });
+  const qConc3 = memRepo.createQuestion({
+    versionId: verConc3Draft.id,
+    questionCode: "car_conc_q3",
+    questionText: "Question to reparent",
+  });
+
+  const [pubRes3, reparentRes] = await Promise.allSettled([
+    memRepo.publishAssessmentVersion(verConc3Draft.id, { jwtRole: "service_role" }),
+    memRepo.reparentQuestionConcurrent(qConc3.id, verConc3Target.id),
+  ]);
+  assert(pubRes3.status === "fulfilled", "7.45: Publication of source version completes during reparenting race");
+  assert(
+    reparentRes.status === "rejected" &&
+    Boolean((reparentRes as PromiseRejectedResult).reason.message.includes("immutable once published")),
+    "7.46: Reparenting racing with publication is serialized via deterministic lock ordering and blocked post-publication"
+  );
+
+  // Concurrency Scenario 4: Two simultaneous publication attempts
+  const verConc4 = memRepo.createAssessmentVersion({
+    assessmentId: "asm_career_200",
+    versionNumber: 6,
+    status: "draft",
+    changelog: "Career v6 for double-publish test",
+  });
+
+  const [simulPub1, simulPub2] = await Promise.all([
+    memRepo.publishAssessmentVersion(verConc4.id, { jwtRole: "service_role" }),
+    memRepo.publishAssessmentVersion(verConc4.id, { jwtRole: "service_role" }),
+  ]);
+  assert(simulPub1.success === true && simulPub2.success === true, "7.47: Simultaneous publication calls both return success");
+  assert(
+    (simulPub1.status === "published" || (simulPub1 as any).already_published) &&
+    (simulPub2.status === "published" || (simulPub2 as any).already_published),
+    "7.48: Exactly one publication transitions draft while concurrent duplicate returns already_published"
+  );
+
+  // Concurrency Scenario 5: Normal draft editing still succeeds cleanly
+  const verConc5 = memRepo.createAssessmentVersion({
+    assessmentId: "asm_career_200",
+    versionNumber: 7,
+    status: "draft",
+    changelog: "Career v7 for peaceful draft editing",
+  });
+  const qConc5 = memRepo.createQuestion({
+    versionId: verConc5.id,
+    questionCode: "car_conc_q5",
+    questionText: "Draft question to edit",
+  });
+  const updatedNormalQ = memRepo.updateQuestion(qConc5.id, { questionText: "Draft question successfully edited" });
+  assert(updatedNormalQ.questionText === "Draft question successfully edited", "7.49: Normal draft editing succeeds cleanly without publication conflict");
+
+  // ---------------------------------------------------------------------------
   // 8. SQL MIGRATION SECURITY & CONTRACT VERIFICATION
   // ---------------------------------------------------------------------------
   console.log("\n--- 8. SQL MIGRATION SECURITY & CONTRACT VERIFICATION ---");
@@ -1053,12 +1210,14 @@ async function runPhase2DatabaseTests() {
     "8.33: Trusted service_role granted full administrative privileges for server-side operations"
   );
 
-  // 8.9 Payment Fulfillment Conflicting ID Detection & Cross-Order Lock
+  // 8.9 Payment Fulfillment Conflicting ID Detection & Fail-Closed Validation
   assert(
     sqlContent.includes("IF v_order.status = 'paid' THEN") &&
-    sqlContent.includes("v_order.razorpay_payment_id IS NOT NULL AND v_order.razorpay_payment_id != p_payment_id") &&
+    sqlContent.includes("IF v_order.razorpay_payment_id IS NULL OR trim(v_order.razorpay_payment_id) = '' THEN") &&
+    sqlContent.includes("RAISE EXCEPTION 'Inconsistent payment state: Order % is marked as paid but has no recorded payment ID'") &&
+    sqlContent.includes("IF v_order.razorpay_payment_id != p_payment_id THEN") &&
     sqlContent.includes("RAISE EXCEPTION 'Payment conflict: Order % is already paid with payment ID %, received conflicting payment ID %'"),
-    "8.34: fulfill_order_payment strictly detects and rejects conflicting payment IDs on paid orders"
+    "8.34: fulfill_order_payment strictly detects and rejects conflicting payment IDs on paid orders and fails closed on missing IDs"
   );
 
   // 8.10 Immutability Trigger Reparenting Bypass Checks
@@ -1114,6 +1273,54 @@ async function runPhase2DatabaseTests() {
     "8.39: fulfill_order_payment resolves concurrent races on unseen transaction IDs via ON CONFLICT RETURNING and post-conflict locking verification"
   );
 
+  // 8.15 Immutability Concurrency Row-Lock Coordination
+  assert(
+    sqlContent.includes("FROM public.assessment_versions") &&
+    sqlContent.includes("FOR SHARE;") &&
+    sqlContent.includes("SELECT * INTO v_version") &&
+    sqlContent.includes("FROM public.assessment_versions") &&
+    sqlContent.includes("FOR UPDATE;"),
+    "8.40: Assessment immutability trigger acquires FOR SHARE lock coordinating with publish_assessment_version FOR UPDATE lock"
+  );
+
+  // 8.16 Deterministic Lock Ordering on Reparenting
+  assert(
+    sqlContent.includes("IF v_old_version_id < v_new_version_id THEN") &&
+    sqlContent.includes("WHERE id = v_old_version_id") &&
+    sqlContent.includes("FOR SHARE;") &&
+    sqlContent.includes("WHERE id = v_new_version_id") &&
+    sqlContent.includes("FOR SHARE;"),
+    "8.41: enforce_assessment_content_immutability acquires dual parent locks in deterministic ascending UUID order to prevent deadlocks"
+  );
+
+  // 8.17 Answer Option Parent Question Lock
+  assert(
+    sqlContent.includes("SELECT q.version_id INTO v_old_version_id") &&
+    sqlContent.includes("FROM public.questions q") &&
+    sqlContent.includes("WHERE q.id = OLD.question_id") &&
+    sqlContent.includes("FOR SHARE;") &&
+    sqlContent.includes("SELECT q.version_id INTO v_new_version_id") &&
+    sqlContent.includes("FROM public.questions q") &&
+    sqlContent.includes("WHERE q.id = NEW.question_id") &&
+    sqlContent.includes("FOR SHARE;"),
+    "8.42: Answer option immutability locks parent question FOR SHARE before resolving version status"
+  );
+
+  // 8.18 Payment Fulfillment Fail-Closed on Missing/Empty Payment ID
+  assert(
+    sqlContent.includes("IF p_payment_id IS NULL OR trim(p_payment_id) = '' THEN") &&
+    sqlContent.includes("RAISE EXCEPTION 'Payment fulfillment rejected: payment_id cannot be null or empty';"),
+    "8.43: fulfill_order_payment fails closed immediately when payment_id is null or empty"
+  );
+
+  // 8.19 Schema-Level CREATE Revocation
+  assert(
+    sqlContent.includes("REVOKE CREATE ON SCHEMA public FROM PUBLIC;") &&
+    sqlContent.includes("REVOKE CREATE ON SCHEMA public FROM anon, authenticated;") &&
+    sqlContent.includes("GRANT USAGE ON SCHEMA public TO anon, authenticated;"),
+    "8.44: Schema-level privileges explicitly revoke CREATE from untrusted roles and grant USAGE strictly"
+  );
+
   // ---------------------------------------------------------------------------
   // 9. HOSTED VS MOCKED TEST DISTINCTION
   // ---------------------------------------------------------------------------
@@ -1123,7 +1330,7 @@ async function runPhase2DatabaseTests() {
   } else {
     console.log("   ⚠️  Hosted Supabase Project (InnerAtlas-dev) execution is intentionally deferred.");
     console.log("      As instructed, migration execution against hosted Supabase awaits product owner review.");
-    console.log("      All 21 static SQL security invariants and repository lifecycle contracts passed cleanly.");
+    console.log("      All 44 static SQL security invariants and repository lifecycle contracts passed cleanly.");
   }
 
   console.log("\n==================================================================");

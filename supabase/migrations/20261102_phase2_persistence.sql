@@ -264,46 +264,105 @@ DECLARE
     v_old_status TEXT;
     v_new_status TEXT;
 BEGIN
-    -- 1. Resolve OLD parent version (for UPDATE and DELETE)
+    -- 1. Identify OLD parent version (for UPDATE and DELETE)
     IF TG_OP IN ('UPDATE', 'DELETE') THEN
         IF TG_TABLE_NAME = 'scoring_dimensions' THEN
             v_old_version_id := OLD.version_id;
         ELSIF TG_TABLE_NAME = 'questions' THEN
             v_old_version_id := OLD.version_id;
         ELSIF TG_TABLE_NAME = 'answer_options' THEN
+            -- Acquire FOR SHARE lock on parent question to serialize against concurrent question modifications
             SELECT q.version_id INTO v_old_version_id
             FROM public.questions q
-            WHERE q.id = OLD.question_id;
-        END IF;
-
-        IF v_old_version_id IS NOT NULL THEN
-            SELECT status INTO v_old_status
-            FROM public.assessment_versions
-            WHERE id = v_old_version_id;
-
-            IF v_old_status IN ('published', 'archived') THEN
-                RAISE EXCEPTION 'Cannot % % on % assessment version (version_id: %). Content is immutable once published.',
-                    TG_OP, TG_TABLE_NAME, v_old_status, v_old_version_id;
-            END IF;
+            WHERE q.id = OLD.question_id
+            FOR SHARE;
         END IF;
     END IF;
 
-    -- 2. Resolve NEW parent version (for INSERT and UPDATE)
+    -- 2. Identify NEW parent version (for INSERT and UPDATE)
     IF TG_OP IN ('INSERT', 'UPDATE') THEN
         IF TG_TABLE_NAME = 'scoring_dimensions' THEN
             v_new_version_id := NEW.version_id;
         ELSIF TG_TABLE_NAME = 'questions' THEN
             v_new_version_id := NEW.version_id;
         ELSIF TG_TABLE_NAME = 'answer_options' THEN
+            -- Acquire FOR SHARE lock on parent question to serialize against concurrent question modifications
             SELECT q.version_id INTO v_new_version_id
             FROM public.questions q
-            WHERE q.id = NEW.question_id;
+            WHERE q.id = NEW.question_id
+            FOR SHARE;
+        END IF;
+    END IF;
+
+    -- 3. Acquire conflicting FOR SHARE locks on assessment_versions in deterministic order
+    -- FOR SHARE coordinates directly with publish_assessment_version (which acquires FOR UPDATE)
+    -- Case A: Single version affected (INSERT, DELETE, or in-place UPDATE without reparenting)
+    IF (v_old_version_id IS NOT NULL AND v_new_version_id IS NULL) THEN
+        -- DELETE operation
+        SELECT status INTO v_old_status
+        FROM public.assessment_versions
+        WHERE id = v_old_version_id
+        FOR SHARE;
+
+        IF v_old_status IN ('published', 'archived') THEN
+            RAISE EXCEPTION 'Cannot % % on % assessment version (version_id: %). Content is immutable once published.',
+                TG_OP, TG_TABLE_NAME, v_old_status, v_old_version_id;
         END IF;
 
-        IF v_new_version_id IS NOT NULL THEN
-            SELECT status INTO v_new_status
+    ELSIF (v_old_version_id IS NULL AND v_new_version_id IS NOT NULL) THEN
+        -- INSERT operation
+        SELECT status INTO v_new_status
+        FROM public.assessment_versions
+        WHERE id = v_new_version_id
+        FOR SHARE;
+
+        IF v_new_status IN ('published', 'archived') THEN
+            RAISE EXCEPTION 'Cannot % % into % assessment version (version_id: %). Content is immutable once published.',
+                TG_OP, TG_TABLE_NAME, v_new_status, v_new_version_id;
+        END IF;
+
+    ELSIF (v_old_version_id IS NOT NULL AND v_new_version_id IS NOT NULL) THEN
+        -- UPDATE operation
+        IF v_old_version_id = v_new_version_id THEN
+            -- In-place update within same version: acquire single lock
+            SELECT status INTO v_old_status
             FROM public.assessment_versions
-            WHERE id = v_new_version_id;
+            WHERE id = v_old_version_id
+            FOR SHARE;
+
+            IF v_old_status IN ('published', 'archived') THEN
+                RAISE EXCEPTION 'Cannot % % on % assessment version (version_id: %). Content is immutable once published.',
+                    TG_OP, TG_TABLE_NAME, v_old_status, v_old_version_id;
+            END IF;
+        ELSE
+            -- Reparenting across two versions: acquire locks in deterministic ascending UUID order to avoid deadlocks
+            IF v_old_version_id < v_new_version_id THEN
+                SELECT status INTO v_old_status
+                FROM public.assessment_versions
+                WHERE id = v_old_version_id
+                FOR SHARE;
+
+                SELECT status INTO v_new_status
+                FROM public.assessment_versions
+                WHERE id = v_new_version_id
+                FOR SHARE;
+            ELSE
+                SELECT status INTO v_new_status
+                FROM public.assessment_versions
+                WHERE id = v_new_version_id
+                FOR SHARE;
+
+                SELECT status INTO v_old_status
+                FROM public.assessment_versions
+                WHERE id = v_old_version_id
+                FOR SHARE;
+            END IF;
+
+            -- Both locks acquired deterministically; verify both parent version statuses
+            IF v_old_status IN ('published', 'archived') THEN
+                RAISE EXCEPTION 'Cannot % % on % assessment version (version_id: %). Content is immutable once published.',
+                    TG_OP, TG_TABLE_NAME, v_old_status, v_old_version_id;
+            END IF;
 
             IF v_new_status IN ('published', 'archived') THEN
                 RAISE EXCEPTION 'Cannot % % into % assessment version (version_id: %). Content is immutable once published.',
@@ -753,6 +812,11 @@ DECLARE
     v_inserted_payment_id TEXT;
     v_now TIMESTAMPTZ := timezone('utc'::text, now());
 BEGIN
+    -- 0. Fail closed immediately on missing or empty payment ID
+    IF p_payment_id IS NULL OR trim(p_payment_id) = '' THEN
+        RAISE EXCEPTION 'Payment fulfillment rejected: payment_id cannot be null or empty';
+    END IF;
+
     -- 1. Select and lock order row
     SELECT * INTO v_order
     FROM public.orders
@@ -801,10 +865,15 @@ BEGIN
         END IF;
     END IF;
 
-    -- 5. Check for idempotent already-paid state with payment conflict detection
+    -- 5. Check for idempotent already-paid state with strict payment validation
     IF v_order.status = 'paid' THEN
-        -- If already paid, the incoming payment ID must match the recorded payment ID
-        IF v_order.razorpay_payment_id IS NOT NULL AND v_order.razorpay_payment_id != p_payment_id THEN
+        -- If order is marked paid but has no recorded payment ID, fail closed on inconsistent payment state
+        IF v_order.razorpay_payment_id IS NULL OR trim(v_order.razorpay_payment_id) = '' THEN
+            RAISE EXCEPTION 'Inconsistent payment state: Order % is marked as paid but has no recorded payment ID', p_order_id;
+        END IF;
+
+        -- Recorded payment ID must match the incoming payment ID exactly
+        IF v_order.razorpay_payment_id != p_payment_id THEN
             RAISE EXCEPTION 'Payment conflict: Order % is already paid with payment ID %, received conflicting payment ID %',
                 p_order_id, v_order.razorpay_payment_id, p_payment_id;
         END IF;

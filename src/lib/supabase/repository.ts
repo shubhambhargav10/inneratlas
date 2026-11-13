@@ -195,6 +195,10 @@ export class SupabasePostgresRepository implements DatabaseRepository {
     paymentId: string,
     signature?: string
   ): Promise<{ order: OrderRecord; report: ReportRecord; accessToken: string }> {
+    if (!paymentId || !paymentId.trim()) {
+      throw new Error("Payment fulfillment rejected: payment_id cannot be null or empty");
+    }
+
     const order = await this.getOrderById(orderId);
     if (!order) {
       throw new Error(`Order ${orderId} not found`);
@@ -240,9 +244,12 @@ export class SupabasePostgresRepository implements DatabaseRepository {
 
     // Verify idempotent already-paid state with conflict check
     if (order.status === "paid") {
-      if (order.razorpayPaymentId && order.razorpayPaymentId !== paymentId) {
+      if (!order.razorpayPaymentId || !order.razorpayPaymentId.trim()) {
+        throw new Error(`Inconsistent payment state: Order ${orderId} is marked as paid but has no recorded payment ID`);
+      }
+      if (order.razorpayPaymentId !== paymentId) {
         throw new Error(
-          `Payment conflict: Order ${orderId} is already paid under payment ID ${order.razorpayPaymentId}, received conflicting payment ID ${paymentId}`
+          `Payment conflict: Order ${orderId} is already paid with payment ID ${order.razorpayPaymentId}, received conflicting payment ID ${paymentId}`
         );
       }
       const existingReport = await this.getReportByOrderId(orderId);
@@ -983,6 +990,10 @@ export class InMemoryRepository implements DatabaseRepository {
     paymentId: string,
     signature?: string
   ): Promise<{ order: OrderRecord; report: ReportRecord; accessToken: string }> {
+    if (!paymentId || !paymentId.trim()) {
+      throw new Error("Payment fulfillment rejected: payment_id cannot be null or empty");
+    }
+
     const order = this.orders.get(orderId);
     if (!order) throw new Error(`Order ${orderId} not found`);
 
@@ -996,9 +1007,12 @@ export class InMemoryRepository implements DatabaseRepository {
     }
 
     if (order.status === "paid") {
-      if (order.razorpayPaymentId && order.razorpayPaymentId !== paymentId) {
+      if (!order.razorpayPaymentId || !order.razorpayPaymentId.trim()) {
+        throw new Error(`Inconsistent payment state: Order ${orderId} is marked as paid but has no recorded payment ID`);
+      }
+      if (order.razorpayPaymentId !== paymentId) {
         throw new Error(
-          `Payment conflict: Order ${orderId} is already paid under payment ID ${order.razorpayPaymentId}, received conflicting payment ID ${paymentId}`
+          `Payment conflict: Order ${orderId} is already paid with payment ID ${order.razorpayPaymentId}, received conflicting payment ID ${paymentId}`
         );
       }
       const existingReport = Array.from(this.reports.values()).find((r) => r.orderId === orderId);
@@ -1464,6 +1478,91 @@ export class InMemoryRepository implements DatabaseRepository {
     this.answerOptions.delete(optId);
   }
 
+  // Simulated row locks modeling PostgreSQL FOR SHARE / FOR UPDATE lock matrix
+  private versionLocks = new Map<string, { mode: "share" | "update"; count: number; waiters: Array<() => void> }>();
+
+  async acquireVersionLock(versionId: string, mode: "share" | "update"): Promise<() => void> {
+    while (true) {
+      const current = this.versionLocks.get(versionId);
+      if (!current || current.count <= 0) {
+        const existingWaiters = current ? current.waiters : [];
+        const entry = { mode, count: 1, waiters: existingWaiters };
+        this.versionLocks.set(versionId, entry);
+
+        return () => {
+          entry.count--;
+          if (entry.count <= 0) {
+            if (entry.waiters.length > 0) {
+              const next = entry.waiters.shift();
+              if (next) next();
+            } else {
+              this.versionLocks.delete(versionId);
+            }
+          }
+        };
+      }
+
+      if (current.mode === "share" && mode === "share" && current.waiters.length === 0) {
+        current.count++;
+        return () => {
+          current.count--;
+          if (current.count <= 0) {
+            if (current.waiters.length > 0) {
+              const next = current.waiters.shift();
+              if (next) next();
+            } else {
+              this.versionLocks.delete(versionId);
+            }
+          }
+        };
+      }
+
+      // Conflicting lock mode: wait for release
+      await new Promise<void>((resolve) => current.waiters.push(resolve));
+    }
+  }
+
+  async updateQuestionConcurrent(questionId: string, updates: { questionText?: string; versionId?: string }) {
+    const q = this.questions.get(questionId);
+    if (!q) throw new Error(`Question ${questionId} not found`);
+    const releaseLock = await this.acquireVersionLock(q.versionId, "share");
+    try {
+      await new Promise((r) => setTimeout(r, 15));
+      return this.updateQuestion(questionId, updates);
+    } finally {
+      releaseLock();
+    }
+  }
+
+  async updateAnswerOptionConcurrent(optId: string, updates: { label?: string; questionId?: string }) {
+    const opt = this.answerOptions.get(optId);
+    if (!opt) throw new Error(`Answer option ${optId} not found`);
+    const q = this.questions.get(opt.questionId);
+    if (!q) throw new Error(`Question ${opt.questionId} not found`);
+    const releaseLock = await this.acquireVersionLock(q.versionId, "share");
+    try {
+      await new Promise((r) => setTimeout(r, 15));
+      return this.updateAnswerOption(optId, updates);
+    } finally {
+      releaseLock();
+    }
+  }
+
+  async reparentQuestionConcurrent(questionId: string, newVersionId: string) {
+    const q = this.questions.get(questionId);
+    if (!q) throw new Error(`Question ${questionId} not found`);
+    const [firstId, secondId] = q.versionId < newVersionId ? [q.versionId, newVersionId] : [newVersionId, q.versionId];
+    const release1 = await this.acquireVersionLock(firstId, "share");
+    const release2 = await this.acquireVersionLock(secondId, "share");
+    try {
+      await new Promise((r) => setTimeout(r, 15));
+      return this.updateQuestion(questionId, { versionId: newVersionId });
+    } finally {
+      release2();
+      release1();
+    }
+  }
+
   async publishAssessmentVersion(
     versionId: string,
     callerContext?: { jwtRole?: string }
@@ -1472,47 +1571,55 @@ export class InMemoryRepository implements DatabaseRepository {
     if (jwtRole === "authenticated" || jwtRole === "anon") {
       throw new Error("Unauthorized: RPC publish_assessment_version requires trusted service_role privileges.");
     }
-    const ver = this.assessmentVersions.get(versionId);
-    if (!ver) throw new Error(`Assessment version ${versionId} not found`);
-    if (ver.status === "published") {
-      return { success: true, versionId: ver.id, versionNumber: ver.versionNumber, status: "published" };
-    }
-    if (ver.status === "archived") {
-      throw new Error(`Cannot publish archived version ${versionId}`);
-    }
 
-    // Reject version number regression or duplicate published version number
-    let currentPublishedVersionNumber = 0;
-    for (const v of this.assessmentVersions.values()) {
-      if (v.assessmentId === ver.assessmentId && v.status === "published" && v.id !== versionId) {
-        if (v.versionNumber > currentPublishedVersionNumber) {
-          currentPublishedVersionNumber = v.versionNumber;
+    const releaseLock = await this.acquireVersionLock(versionId, "update");
+    try {
+      await new Promise((r) => setTimeout(r, 20));
+
+      const ver = this.assessmentVersions.get(versionId);
+      if (!ver) throw new Error(`Assessment version ${versionId} not found`);
+      if (ver.status === "published") {
+        return { success: true, versionId: ver.id, versionNumber: ver.versionNumber, status: "published" };
+      }
+      if (ver.status === "archived") {
+        throw new Error(`Cannot publish archived version ${versionId}`);
+      }
+
+      // Reject version number regression or duplicate published version number
+      let currentPublishedVersionNumber = 0;
+      for (const v of this.assessmentVersions.values()) {
+        if (v.assessmentId === ver.assessmentId && v.status === "published" && v.id !== versionId) {
+          if (v.versionNumber > currentPublishedVersionNumber) {
+            currentPublishedVersionNumber = v.versionNumber;
+          }
         }
       }
-    }
 
-    if (ver.versionNumber <= currentPublishedVersionNumber) {
-      throw new Error(
-        `Version regression rejected: Target version number ${ver.versionNumber} must be strictly greater than current published version number ${currentPublishedVersionNumber}.`
-      );
-    }
-
-    // Archive previous published version for this assessment
-    for (const v of this.assessmentVersions.values()) {
-      if (v.assessmentId === ver.assessmentId && v.status === "published" && v.id !== versionId) {
-        v.status = "archived";
+      if (ver.versionNumber <= currentPublishedVersionNumber) {
+        throw new Error(
+          `Version regression rejected: Target version number ${ver.versionNumber} must be strictly greater than current published version number ${currentPublishedVersionNumber}.`
+        );
       }
+
+      // Archive previous published version for this assessment
+      for (const v of this.assessmentVersions.values()) {
+        if (v.assessmentId === ver.assessmentId && v.status === "published" && v.id !== versionId) {
+          v.status = "archived";
+        }
+      }
+
+      ver.status = "published";
+      ver.publishedAt = new Date().toISOString();
+
+      return {
+        success: true,
+        versionId: ver.id,
+        versionNumber: ver.versionNumber,
+        status: "published",
+      };
+    } finally {
+      releaseLock();
     }
-
-    ver.status = "published";
-    ver.publishedAt = new Date().toISOString();
-
-    return {
-      success: true,
-      versionId: ver.id,
-      versionNumber: ver.versionNumber,
-      status: "published",
-    };
   }
 
   async saveCalculatedResult(sessionId: string, result: AssessmentResult): Promise<void> {
