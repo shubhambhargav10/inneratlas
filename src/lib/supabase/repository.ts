@@ -251,6 +251,19 @@ export class SupabasePostgresRepository implements DatabaseRepository {
       }
     }
 
+    // Verify transaction consistency across other orders in database
+    const { data: conflictingPayment } = await this.client
+      .from("payments")
+      .select("order_id")
+      .eq("transaction_id", paymentId)
+      .maybeSingle();
+
+    if (conflictingPayment && conflictingPayment.order_id !== orderId) {
+      throw new Error(
+        `Payment transaction conflict: Transaction ${paymentId} already belongs to order ${conflictingPayment.order_id}, cannot be reused for order ${orderId}`
+      );
+    }
+
     // Sequential fallback if RPC is not installed
     const now = new Date().toISOString();
     const { data: updatedOrderData, error: updateError } = await this.client
@@ -890,6 +903,8 @@ export class InMemoryRepository implements DatabaseRepository {
   private profiles = new Map<string, ProfileRecord>();
   private assessmentVersions = new Map<string, { id: string; assessmentId: string; versionNumber: number; status: "draft" | "published" | "archived"; changelog?: string; publishedAt?: string }>();
   private questions = new Map<string, { id: string; versionId: string; questionCode: string; questionText: string }>();
+  private scoringDimensions = new Map<string, { id: string; versionId: string; key: string; name: string }>();
+  private answerOptions = new Map<string, { id: string; questionId: string; orderIndex: number; label: string; value: number }>();
 
   async createOrder(data: {
     guestSessionToken: string;
@@ -956,6 +971,15 @@ export class InMemoryRepository implements DatabaseRepository {
   ): Promise<{ order: OrderRecord; report: ReportRecord; accessToken: string }> {
     const order = this.orders.get(orderId);
     if (!order) throw new Error(`Order ${orderId} not found`);
+
+    // Verify transaction consistency across all existing orders
+    for (const otherOrder of this.orders.values()) {
+      if (otherOrder.id !== orderId && otherOrder.razorpayPaymentId === paymentId) {
+        throw new Error(
+          `Payment transaction conflict: Transaction ${paymentId} already belongs to order ${otherOrder.id}, cannot be reused for order ${orderId}`
+        );
+      }
+    }
 
     if (order.status === "paid") {
       if (order.razorpayPaymentId && order.razorpayPaymentId !== paymentId) {
@@ -1287,7 +1311,7 @@ export class InMemoryRepository implements DatabaseRepository {
   createQuestion(data: { id?: string; versionId: string; questionCode: string; questionText: string }) {
     const ver = this.assessmentVersions.get(data.versionId);
     if (ver && (ver.status === "published" || ver.status === "archived")) {
-      throw new Error(`Cannot insert question on ${ver.status} assessment version. Content is immutable once published.`);
+      throw new Error(`Cannot insert questions into ${ver.status} assessment version (version_id: ${ver.id}). Content is immutable once published.`);
     }
     const id = data.id || "q_" + crypto.randomBytes(8).toString("hex");
     const q = { id, versionId: data.versionId, questionCode: data.questionCode, questionText: data.questionText };
@@ -1295,14 +1319,21 @@ export class InMemoryRepository implements DatabaseRepository {
     return q;
   }
 
-  updateQuestion(questionId: string, updates: { questionText?: string }) {
+  updateQuestion(questionId: string, updates: { questionText?: string; versionId?: string }) {
     const q = this.questions.get(questionId);
     if (!q) throw new Error(`Question ${questionId} not found`);
-    const ver = this.assessmentVersions.get(q.versionId);
-    if (ver && (ver.status === "published" || ver.status === "archived")) {
-      throw new Error(`Cannot update question on ${ver.status} assessment version. Content is immutable once published.`);
+    const oldVer = this.assessmentVersions.get(q.versionId);
+    if (oldVer && (oldVer.status === "published" || oldVer.status === "archived")) {
+      throw new Error(`Cannot update questions on ${oldVer.status} assessment version (version_id: ${oldVer.id}). Content is immutable once published.`);
     }
-    if (updates.questionText) q.questionText = updates.questionText;
+    if (updates.versionId && updates.versionId !== q.versionId) {
+      const newVer = this.assessmentVersions.get(updates.versionId);
+      if (newVer && (newVer.status === "published" || newVer.status === "archived")) {
+        throw new Error(`Cannot update questions into ${newVer.status} assessment version (version_id: ${newVer.id}). Content is immutable once published.`);
+      }
+      q.versionId = updates.versionId;
+    }
+    if (updates.questionText !== undefined) q.questionText = updates.questionText;
     return q;
   }
 
@@ -1311,9 +1342,95 @@ export class InMemoryRepository implements DatabaseRepository {
     if (!q) throw new Error(`Question ${questionId} not found`);
     const ver = this.assessmentVersions.get(q.versionId);
     if (ver && (ver.status === "published" || ver.status === "archived")) {
-      throw new Error(`Cannot delete question on ${ver.status} assessment version. Content is immutable once published.`);
+      throw new Error(`Cannot delete questions on ${ver.status} assessment version (version_id: ${ver.id}). Content is immutable once published.`);
     }
     this.questions.delete(questionId);
+  }
+
+  createScoringDimension(data: { id?: string; versionId: string; key: string; name: string }) {
+    const ver = this.assessmentVersions.get(data.versionId);
+    if (ver && (ver.status === "published" || ver.status === "archived")) {
+      throw new Error(`Cannot insert scoring_dimensions into ${ver.status} assessment version (version_id: ${ver.id}). Content is immutable once published.`);
+    }
+    const id = data.id || "dim_" + crypto.randomBytes(8).toString("hex");
+    const dim = { id, versionId: data.versionId, key: data.key, name: data.name };
+    this.scoringDimensions.set(id, dim);
+    return dim;
+  }
+
+  updateScoringDimension(dimId: string, updates: { name?: string; versionId?: string }) {
+    const dim = this.scoringDimensions.get(dimId);
+    if (!dim) throw new Error(`Scoring dimension ${dimId} not found`);
+    const oldVer = this.assessmentVersions.get(dim.versionId);
+    if (oldVer && (oldVer.status === "published" || oldVer.status === "archived")) {
+      throw new Error(`Cannot update scoring_dimensions on ${oldVer.status} assessment version (version_id: ${oldVer.id}). Content is immutable once published.`);
+    }
+    if (updates.versionId && updates.versionId !== dim.versionId) {
+      const newVer = this.assessmentVersions.get(updates.versionId);
+      if (newVer && (newVer.status === "published" || newVer.status === "archived")) {
+        throw new Error(`Cannot update scoring_dimensions into ${newVer.status} assessment version (version_id: ${newVer.id}). Content is immutable once published.`);
+      }
+      dim.versionId = updates.versionId;
+    }
+    if (updates.name !== undefined) dim.name = updates.name;
+    return dim;
+  }
+
+  deleteScoringDimension(dimId: string) {
+    const dim = this.scoringDimensions.get(dimId);
+    if (!dim) throw new Error(`Scoring dimension ${dimId} not found`);
+    const ver = this.assessmentVersions.get(dim.versionId);
+    if (ver && (ver.status === "published" || ver.status === "archived")) {
+      throw new Error(`Cannot delete scoring_dimensions on ${ver.status} assessment version (version_id: ${ver.id}). Content is immutable once published.`);
+    }
+    this.scoringDimensions.delete(dimId);
+  }
+
+  createAnswerOption(data: { id?: string; questionId: string; orderIndex: number; label: string; value: number }) {
+    const q = this.questions.get(data.questionId);
+    if (!q) throw new Error(`Question ${data.questionId} not found`);
+    const ver = this.assessmentVersions.get(q.versionId);
+    if (ver && (ver.status === "published" || ver.status === "archived")) {
+      throw new Error(`Cannot insert answer_options into ${ver.status} assessment version (version_id: ${ver.id}). Content is immutable once published.`);
+    }
+    const id = data.id || "opt_" + crypto.randomBytes(8).toString("hex");
+    const opt = { id, questionId: data.questionId, orderIndex: data.orderIndex, label: data.label, value: data.value };
+    this.answerOptions.set(id, opt);
+    return opt;
+  }
+
+  updateAnswerOption(optId: string, updates: { label?: string; questionId?: string }) {
+    const opt = this.answerOptions.get(optId);
+    if (!opt) throw new Error(`Answer option ${optId} not found`);
+    const oldQ = this.questions.get(opt.questionId);
+    if (!oldQ) throw new Error(`Question ${opt.questionId} not found`);
+    const oldVer = this.assessmentVersions.get(oldQ.versionId);
+    if (oldVer && (oldVer.status === "published" || oldVer.status === "archived")) {
+      throw new Error(`Cannot update answer_options on ${oldVer.status} assessment version (version_id: ${oldVer.id}). Content is immutable once published.`);
+    }
+    if (updates.questionId && updates.questionId !== opt.questionId) {
+      const newQ = this.questions.get(updates.questionId);
+      if (!newQ) throw new Error(`Target question ${updates.questionId} not found`);
+      const newVer = this.assessmentVersions.get(newQ.versionId);
+      if (newVer && (newVer.status === "published" || newVer.status === "archived")) {
+        throw new Error(`Cannot update answer_options into ${newVer.status} assessment version (version_id: ${newVer.id}). Content is immutable once published.`);
+      }
+      opt.questionId = updates.questionId;
+    }
+    if (updates.label !== undefined) opt.label = updates.label;
+    return opt;
+  }
+
+  deleteAnswerOption(optId: string) {
+    const opt = this.answerOptions.get(optId);
+    if (!opt) throw new Error(`Answer option ${optId} not found`);
+    const q = this.questions.get(opt.questionId);
+    if (!q) throw new Error(`Question ${opt.questionId} not found`);
+    const ver = this.assessmentVersions.get(q.versionId);
+    if (ver && (ver.status === "published" || ver.status === "archived")) {
+      throw new Error(`Cannot delete answer_options on ${ver.status} assessment version (version_id: ${ver.id}). Content is immutable once published.`);
+    }
+    this.answerOptions.delete(optId);
   }
 
   async publishAssessmentVersion(
@@ -1331,6 +1448,22 @@ export class InMemoryRepository implements DatabaseRepository {
     }
     if (ver.status === "archived") {
       throw new Error(`Cannot publish archived version ${versionId}`);
+    }
+
+    // Reject version number regression or duplicate published version number
+    let currentPublishedVersionNumber = 0;
+    for (const v of this.assessmentVersions.values()) {
+      if (v.assessmentId === ver.assessmentId && v.status === "published" && v.id !== versionId) {
+        if (v.versionNumber > currentPublishedVersionNumber) {
+          currentPublishedVersionNumber = v.versionNumber;
+        }
+      }
+    }
+
+    if (ver.versionNumber <= currentPublishedVersionNumber) {
+      throw new Error(
+        `Version regression rejected: Target version number ${ver.versionNumber} must be strictly greater than current published version number ${currentPublishedVersionNumber}.`
+      );
     }
 
     // Archive previous published version for this assessment

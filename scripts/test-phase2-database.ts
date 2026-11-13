@@ -433,9 +433,9 @@ async function runPhase2DatabaseTests() {
   assert(mismatchedResponseThrew, "7.4: User response with question from mismatched version rejected by composite FK");
 
   // ---------------------------------------------------------------------------
-  // 7.3 PUBLISHED ASSESSMENT IMMUTABILITY & VERSION PUBLISHING
+  // 7.3 PUBLISHED ASSESSMENT IMMUTABILITY & REPARENTING BYPASS CLOSURE
   // ---------------------------------------------------------------------------
-  console.log("\n--- 7.3 PUBLISHED ASSESSMENT IMMUTABILITY & VERSION PUBLISHING ---");
+  console.log("\n--- 7.3 PUBLISHED ASSESSMENT IMMUTABILITY & REPARENTING BYPASS CLOSURE ---");
 
   // 7.5 Content editing is allowed on draft versions
   const updatedDraftQ = memRepo.updateQuestion(qDraft.id, {
@@ -443,15 +443,54 @@ async function runPhase2DatabaseTests() {
   });
   assert(updatedDraftQ.questionText.includes("creative work"), "7.5: Draft assessment version questions can be modified freely");
 
+  const dimDraft1 = memRepo.createScoringDimension({
+    versionId: draftVersion.id,
+    key: "pa_openness",
+    name: "Openness to Experience",
+  });
+  const updatedDraftDim = memRepo.updateScoringDimension(dimDraft1.id, {
+    name: "Openness & Intellectual Curiosity",
+  });
+  assert(updatedDraftDim.name.includes("Curiosity"), "7.6: Draft scoring dimensions can be modified freely");
+
+  const optDraft1 = memRepo.createAnswerOption({
+    questionId: qDraft.id,
+    orderIndex: 0,
+    label: "Rarely true",
+    value: 1,
+  });
+  const updatedDraftOpt = memRepo.updateAnswerOption(optDraft1.id, {
+    label: "Almost never true of me",
+  });
+  assert(updatedDraftOpt.label.includes("never true"), "7.7: Draft answer options can be modified freely");
+
+  // Legitimate draft deletions
   const qDraft2 = memRepo.createQuestion({
     versionId: draftVersion.id,
     questionCode: "pa_draft_q2",
     questionText: "Question to delete in draft",
   });
   memRepo.deleteQuestion(qDraft2.id);
-  assert(true, "7.6: Draft assessment questions can be deleted freely");
+  assert(true, "7.8: Draft assessment questions can be deleted freely");
 
-  // 7.7 Published versions reject question creation
+  const dimDraftToDelete = memRepo.createScoringDimension({
+    versionId: draftVersion.id,
+    key: "pa_temp_dim",
+    name: "Temporary Dimension to Delete",
+  });
+  memRepo.deleteScoringDimension(dimDraftToDelete.id);
+  assert(true, "7.9: Draft scoring dimensions can be deleted freely");
+
+  const optDraftToDelete = memRepo.createAnswerOption({
+    questionId: qDraft.id,
+    orderIndex: 1,
+    label: "Temporary Option to Delete",
+    value: 2,
+  });
+  memRepo.deleteAnswerOption(optDraftToDelete.id);
+  assert(true, "7.10: Draft answer options can be deleted freely");
+
+  // 7.11 Published versions reject question creation
   let publishedInsertThrew = false;
   try {
     memRepo.createQuestion({
@@ -464,9 +503,9 @@ async function runPhase2DatabaseTests() {
       publishedInsertThrew = true;
     }
   }
-  assert(publishedInsertThrew, "7.7: Modifying content on published assessment version is strictly blocked by immutability trigger");
+  assert(publishedInsertThrew, "7.11: Modifying content on published assessment version is strictly blocked by immutability trigger");
 
-  // 7.8 Published version cannot be deleted
+  // 7.12 Published version cannot be deleted
   let publishedDeleteThrew = false;
   try {
     memRepo.deleteAssessmentVersion(v1Personality.id);
@@ -475,9 +514,9 @@ async function runPhase2DatabaseTests() {
       publishedDeleteThrew = true;
     }
   }
-  assert(publishedDeleteThrew, "7.8: Published assessment version deletion is strictly blocked for historical integrity");
+  assert(publishedDeleteThrew, "7.12: Published assessment version deletion is strictly blocked for historical integrity");
 
-  // 7.9 Publishing RPC rejects unauthenticated or anon callers
+  // 7.13 Publishing RPC rejects unauthenticated or anon callers
   let unauthorizedPublishThrew = false;
   try {
     await memRepo.publishAssessmentVersion(draftVersion.id, { jwtRole: "authenticated" });
@@ -486,24 +525,267 @@ async function runPhase2DatabaseTests() {
       unauthorizedPublishThrew = true;
     }
   }
-  assert(unauthorizedPublishThrew, "7.9: publish_assessment_version RPC strictly rejects unprivileged callers");
+  assert(unauthorizedPublishThrew, "7.13: publish_assessment_version RPC strictly rejects unprivileged callers");
 
-  // 7.10 Publishing RPC by service_role archives prior version and publishes draft
+  // 7.14 Publishing RPC by service_role archives prior version and publishes draft
   const publishResult = await memRepo.publishAssessmentVersion(draftVersion.id, { jwtRole: "service_role" });
-  assert(publishResult.success === true, "7.10: publish_assessment_version RPC succeeds for service_role");
-  assert(publishResult.status === "published", "7.11: Draft version successfully transitioned to published");
-  assert(publishResult.versionNumber === 2, "7.12: Published version number is 2");
+  assert(publishResult.success === true, "7.14: publish_assessment_version RPC succeeds for service_role");
+  assert(publishResult.status === "published", "7.15: Draft version successfully transitioned to published");
+  assert(publishResult.versionNumber === 2, "7.16: Published version number is 2");
 
-  // 7.13 Questions in newly published version are now immutable
-  let nowImmutableThrew = false;
+  // 7.17 Content in newly published version is now locked and immutable
+  let nowImmutableQThrew = false;
   try {
     memRepo.updateQuestion(qDraft.id, { questionText: "Illegal edit post-publication" });
   } catch (err: any) {
     if (err.message.includes("immutable once published")) {
-      nowImmutableThrew = true;
+      nowImmutableQThrew = true;
     }
   }
-  assert(nowImmutableThrew, "7.13: Questions locked and immutable once version is published");
+  assert(nowImmutableQThrew, "7.17: Questions locked and immutable once version is published");
+
+  let nowImmutableDimThrew = false;
+  try {
+    memRepo.updateScoringDimension(dimDraft1.id, { name: "Illegal dimension edit post-publication" });
+  } catch (err: any) {
+    if (err.message.includes("immutable once published")) {
+      nowImmutableDimThrew = true;
+    }
+  }
+  assert(nowImmutableDimThrew, "7.18: Scoring dimensions locked and immutable once version is published");
+
+  let nowImmutableOptThrew = false;
+  try {
+    memRepo.updateAnswerOption(optDraft1.id, { label: "Illegal option edit post-publication" });
+  } catch (err: any) {
+    if (err.message.includes("immutable once published")) {
+      nowImmutableOptThrew = true;
+    }
+  }
+  assert(nowImmutableOptThrew, "7.19: Answer options locked and immutable once version is published");
+
+  // 7.20 REPARENTING BYPASS CLOSURE: Testing OLD and NEW parent checks
+  const draftVersion3 = memRepo.createAssessmentVersion({
+    assessmentId: "asm_personality_100",
+    versionNumber: 3,
+    status: "draft",
+    changelog: "Personality v3 draft for reparenting tests",
+  });
+
+  const qDraft3 = memRepo.createQuestion({
+    versionId: draftVersion3.id,
+    questionCode: "pa_v3_q1",
+    questionText: "Draft question in v3",
+  });
+  const dimDraft3 = memRepo.createScoringDimension({
+    versionId: draftVersion3.id,
+    key: "pa_v3_dim1",
+    name: "Draft dimension in v3",
+  });
+  const optDraft3 = memRepo.createAnswerOption({
+    questionId: qDraft3.id,
+    orderIndex: 0,
+    label: "Draft option in v3",
+    value: 1,
+  });
+
+  // Bypass 1: Moving a question from published version (v2) into a draft version (v3) is blocked
+  let movePublishedQThrew = false;
+  try {
+    memRepo.updateQuestion(qDraft.id, { versionId: draftVersion3.id });
+  } catch (err: any) {
+    if (err.message.includes("Cannot update questions on published assessment version")) {
+      movePublishedQThrew = true;
+    }
+  }
+  assert(movePublishedQThrew, "7.20: Moving question from published version into draft version is strictly rejected");
+
+  // Bypass 2: Moving a scoring dimension from published version into draft version is blocked
+  let movePublishedDimThrew = false;
+  try {
+    memRepo.updateScoringDimension(dimDraft1.id, { versionId: draftVersion3.id });
+  } catch (err: any) {
+    if (err.message.includes("Cannot update scoring_dimensions on published assessment version")) {
+      movePublishedDimThrew = true;
+    }
+  }
+  assert(movePublishedDimThrew, "7.21: Moving scoring dimension from published version into draft version is strictly rejected");
+
+  // Bypass 3: Moving an answer option from published question into draft question is blocked
+  let movePublishedOptThrew = false;
+  try {
+    memRepo.updateAnswerOption(optDraft1.id, { questionId: qDraft3.id });
+  } catch (err: any) {
+    if (err.message.includes("Cannot update answer_options on published assessment version")) {
+      movePublishedOptThrew = true;
+    }
+  }
+  assert(movePublishedOptThrew, "7.22: Moving answer option from published question into draft question is strictly rejected");
+
+  // Bypass 4: Moving draft question into a published version is blocked
+  let moveDraftQIntoPublishedThrew = false;
+  try {
+    memRepo.updateQuestion(qDraft3.id, { versionId: draftVersion.id });
+  } catch (err: any) {
+    if (err.message.includes("into published assessment version")) {
+      moveDraftQIntoPublishedThrew = true;
+    }
+  }
+  assert(moveDraftQIntoPublishedThrew, "7.23: Moving draft question into published version is strictly rejected");
+
+  // Bypass 5: Moving draft dimension into a published version is blocked
+  let moveDraftDimIntoPublishedThrew = false;
+  try {
+    memRepo.updateScoringDimension(dimDraft3.id, { versionId: draftVersion.id });
+  } catch (err: any) {
+    if (err.message.includes("into published assessment version")) {
+      moveDraftDimIntoPublishedThrew = true;
+    }
+  }
+  assert(moveDraftDimIntoPublishedThrew, "7.24: Moving draft scoring dimension into published version is strictly rejected");
+
+  // Bypass 6: Moving draft answer option into a published question is blocked
+  let moveDraftOptIntoPublishedThrew = false;
+  try {
+    memRepo.updateAnswerOption(optDraft3.id, { questionId: qDraft.id });
+  } catch (err: any) {
+    if (err.message.includes("into published assessment version")) {
+      moveDraftOptIntoPublishedThrew = true;
+    }
+  }
+  assert(moveDraftOptIntoPublishedThrew, "7.25: Moving draft answer option into published question is strictly rejected");
+
+  // Bypass 7: Deleting published content directly is blocked
+  let deletePubQThrew = false;
+  try {
+    memRepo.deleteQuestion(qDraft.id);
+  } catch (err: any) {
+    if (err.message.includes("immutable once published")) deletePubQThrew = true;
+  }
+  assert(deletePubQThrew, "7.26: Deleting question on published version is strictly rejected");
+
+  let deletePubDimThrew = false;
+  try {
+    memRepo.deleteScoringDimension(dimDraft1.id);
+  } catch (err: any) {
+    if (err.message.includes("immutable once published")) deletePubDimThrew = true;
+  }
+  assert(deletePubDimThrew, "7.27: Deleting scoring dimension on published version is strictly rejected");
+
+  let deletePubOptThrew = false;
+  try {
+    memRepo.deleteAnswerOption(optDraft1.id);
+  } catch (err: any) {
+    if (err.message.includes("immutable once published")) deletePubOptThrew = true;
+  }
+  assert(deletePubOptThrew, "7.28: Deleting answer option on published version is strictly rejected");
+
+  // ---------------------------------------------------------------------------
+  // 7.4 ASSESSMENT VERSION REGRESSION & CONCURRENCY TESTS
+  // ---------------------------------------------------------------------------
+  console.log("\n--- 7.4 ASSESSMENT VERSION REGRESSION & CONCURRENCY TESTS ---");
+
+  // Current published version for asm_personality_100 is 2.
+  // Test: Attempting to publish draft with version_number = 1 is strictly rejected
+  const draftRegress1 = memRepo.createAssessmentVersion({
+    assessmentId: "asm_personality_100",
+    versionNumber: 1,
+    status: "draft",
+    changelog: "Illegal backward version regression to v1",
+  });
+
+  let regressPublish1Threw = false;
+  try {
+    await memRepo.publishAssessmentVersion(draftRegress1.id, { jwtRole: "service_role" });
+  } catch (err: any) {
+    if (err.message.includes("Version regression rejected") && err.message.includes("strictly greater")) {
+      regressPublish1Threw = true;
+    }
+  }
+  assert(regressPublish1Threw, "7.29: Publishing draft with version_number < current_version is strictly rejected");
+
+  // Test: Attempting to publish draft with version_number = 2 (duplicate of current) is strictly rejected
+  const draftRegress2 = memRepo.createAssessmentVersion({
+    assessmentId: "asm_personality_100",
+    versionNumber: 2,
+    status: "draft",
+    changelog: "Illegal duplicate version publishing for v2",
+  });
+
+  let regressPublish2Threw = false;
+  try {
+    await memRepo.publishAssessmentVersion(draftRegress2.id, { jwtRole: "service_role" });
+  } catch (err: any) {
+    if (err.message.includes("Version regression rejected") && err.message.includes("strictly greater")) {
+      regressPublish2Threw = true;
+    }
+  }
+  assert(regressPublish2Threw, "7.30: Publishing draft with version_number == current_version is strictly rejected");
+
+  // Test: Forward publishing (v3 > v2) succeeds cleanly
+  const publishV3Result = await memRepo.publishAssessmentVersion(draftVersion3.id, { jwtRole: "service_role" });
+  assert(publishV3Result.success === true && publishV3Result.versionNumber === 3, "7.31: Forward version publishing (v3 > v2) succeeds cleanly");
+  assert(draftVersion.status === "archived", "7.32: Prior published version (v2) transitioned to archived");
+
+  // Test: Concurrent publishing attempts on same draft serialize safely
+  const draftVersion4 = memRepo.createAssessmentVersion({
+    assessmentId: "asm_personality_100",
+    versionNumber: 4,
+    status: "draft",
+    changelog: "v4 concurrent publishing test",
+  });
+
+  const [concurrentPub1, concurrentPub2] = await Promise.all([
+    memRepo.publishAssessmentVersion(draftVersion4.id, { jwtRole: "service_role" }),
+    memRepo.publishAssessmentVersion(draftVersion4.id, { jwtRole: "service_role" }),
+  ]);
+  assert(concurrentPub1.success === true && concurrentPub2.success === true, "7.33: Concurrent publishing calls both return success");
+  assert(concurrentPub1.versionNumber === 4 && concurrentPub2.versionNumber === 4, "7.34: Concurrent publishing maintains version number 4 atomically");
+  assert(draftVersion4.status === "published", "7.35: Final status of version 4 is published");
+
+  // ---------------------------------------------------------------------------
+  // 7.5 PAYMENT TRANSACTION CONSISTENCY & CONFLICT REJECTION
+  // ---------------------------------------------------------------------------
+  console.log("\n--- 7.5 PAYMENT TRANSACTION CONSISTENCY & CONFLICT REJECTION ---");
+
+  // Create Order A and mark paid
+  const orderA = await memRepo.createOrder({
+    guestSessionToken: `gst_pay_order_a_${runId}`,
+    assessmentSlug: "career-dna",
+    customerName: "Order A Customer",
+    customerEmail: `order_a_${runId}@example.com`,
+    amountPaise: 29900,
+    resultPayload: { archetype: "Strategist" } as any,
+  });
+  const txIdUnique = `pay_tx_unique_${runId}`;
+  await memRepo.markOrderAsPaid(orderA.id, txIdUnique);
+  const paidA = await memRepo.getOrderById(orderA.id);
+  assert(paidA?.status === "paid" && paidA.razorpayPaymentId === txIdUnique, "7.36: Order A marked paid with unique transaction ID");
+
+  // Create Order B
+  const orderB = await memRepo.createOrder({
+    guestSessionToken: `gst_pay_order_b_${runId}`,
+    assessmentSlug: "career-dna",
+    customerName: "Order B Customer",
+    customerEmail: `order_b_${runId}@example.com`,
+    amountPaise: 29900,
+    resultPayload: { archetype: "Strategist" } as any,
+  });
+
+  // Attempt to fulfill Order B using Order A's payment transaction ID
+  let crossOrderConflictThrew = false;
+  try {
+    await memRepo.markOrderAsPaid(orderB.id, txIdUnique);
+  } catch (err: any) {
+    if (err.message.includes("Payment transaction conflict") && err.message.includes(orderA.id)) {
+      crossOrderConflictThrew = true;
+    }
+  }
+  assert(crossOrderConflictThrew, "7.37: Reusing payment transaction ID across different orders is strictly rejected");
+
+  // Idempotent re-fulfillment of Order A with same transaction ID succeeds
+  const replayedOrderA = await memRepo.markOrderAsPaid(orderA.id, txIdUnique);
+  assert(replayedOrderA.order.status === "paid" && replayedOrderA.order.razorpayPaymentId === txIdUnique, "7.38: Idempotent re-fulfillment of Order A succeeds");
 
   // ---------------------------------------------------------------------------
   // 8. SQL MIGRATION SECURITY & CONTRACT VERIFICATION
@@ -736,12 +1018,52 @@ async function runPhase2DatabaseTests() {
     "8.33: Trusted service_role granted full administrative privileges for server-side operations"
   );
 
-  // 8.9 Payment Fulfillment Conflicting ID Detection
+  // 8.9 Payment Fulfillment Conflicting ID Detection & Cross-Order Lock
   assert(
     sqlContent.includes("IF v_order.status = 'paid' THEN") &&
     sqlContent.includes("v_order.razorpay_payment_id IS NOT NULL AND v_order.razorpay_payment_id != p_payment_id") &&
     sqlContent.includes("RAISE EXCEPTION 'Payment conflict: Order % is already paid with payment ID %, received conflicting payment ID %'"),
     "8.34: fulfill_order_payment strictly detects and rejects conflicting payment IDs on paid orders"
+  );
+
+  // 8.10 Immutability Trigger Reparenting Bypass Checks
+  assert(
+    sqlContent.includes("v_old_version_id UUID;") &&
+    sqlContent.includes("v_new_version_id UUID;") &&
+    sqlContent.includes("IF TG_OP IN ('UPDATE', 'DELETE') THEN") &&
+    sqlContent.includes("IF v_old_status IN ('published', 'archived') THEN") &&
+    sqlContent.includes("IF TG_OP IN ('INSERT', 'UPDATE') THEN") &&
+    sqlContent.includes("IF v_new_status IN ('published', 'archived') THEN"),
+    "8.35: enforce_assessment_content_immutability inspects both OLD and NEW parent versions to prevent reparenting bypasses"
+  );
+
+  // 8.11 Assessment Version Regression Prevention
+  assert(
+    sqlContent.includes("IF v_version.version_number <= v_assessment.current_version THEN") &&
+    sqlContent.includes("RAISE EXCEPTION 'Version regression rejected: Target version number % must be strictly greater than current published version number %"),
+    "8.36: publish_assessment_version enforces strict monotonic versioning and rejects backwards or duplicate regression"
+  );
+
+  // 8.12 Payment Transaction Audit Consistency & Cross-Order Verification
+  assert(
+    sqlContent.includes("SELECT * INTO v_existing_payment") &&
+    sqlContent.includes("FROM public.payments") &&
+    sqlContent.includes("WHERE transaction_id = p_payment_id") &&
+    sqlContent.includes("FOR UPDATE;") &&
+    sqlContent.includes("IF v_existing_payment.order_id != p_order_id THEN") &&
+    sqlContent.includes("RAISE EXCEPTION 'Payment transaction conflict: Transaction % already belongs to order %"),
+    "8.37: fulfill_order_payment locks payment transaction and strictly verifies consistent order ownership, amount, and currency"
+  );
+
+  // 8.13 Explicit Schema-Level Privileges (Section 12.0)
+  assert(
+    sqlContent.includes("REVOKE ALL ON SCHEMA public FROM PUBLIC;") &&
+    sqlContent.includes("REVOKE CREATE ON SCHEMA public FROM PUBLIC;") &&
+    sqlContent.includes("REVOKE ALL ON SCHEMA public FROM anon, authenticated;") &&
+    sqlContent.includes("REVOKE CREATE ON SCHEMA public FROM anon, authenticated;") &&
+    sqlContent.includes("GRANT USAGE ON SCHEMA public TO anon, authenticated;") &&
+    sqlContent.includes("GRANT ALL ON SCHEMA public TO service_role;"),
+    "8.38: Schema-level privileges explicitly revoke CREATE and ALL from PUBLIC/anon/authenticated and grant USAGE strictly"
   );
 
   // ---------------------------------------------------------------------------

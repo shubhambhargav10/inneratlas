@@ -259,27 +259,56 @@ LANGUAGE plpgsql
 SET search_path = public, pg_temp
 AS $$
 DECLARE
-    v_version_id UUID;
-    v_status TEXT;
+    v_old_version_id UUID;
+    v_new_version_id UUID;
+    v_old_status TEXT;
+    v_new_status TEXT;
 BEGIN
-    IF TG_TABLE_NAME = 'scoring_dimensions' THEN
-        v_version_id := CASE WHEN TG_OP = 'DELETE' THEN OLD.version_id ELSE NEW.version_id END;
-    ELSIF TG_TABLE_NAME = 'questions' THEN
-        v_version_id := CASE WHEN TG_OP = 'DELETE' THEN OLD.version_id ELSE NEW.version_id END;
-    ELSIF TG_TABLE_NAME = 'answer_options' THEN
-        SELECT q.version_id INTO v_version_id
-        FROM public.questions q
-        WHERE q.id = (CASE WHEN TG_OP = 'DELETE' THEN OLD.question_id ELSE NEW.question_id END);
+    -- 1. Resolve OLD parent version (for UPDATE and DELETE)
+    IF TG_OP IN ('UPDATE', 'DELETE') THEN
+        IF TG_TABLE_NAME = 'scoring_dimensions' THEN
+            v_old_version_id := OLD.version_id;
+        ELSIF TG_TABLE_NAME = 'questions' THEN
+            v_old_version_id := OLD.version_id;
+        ELSIF TG_TABLE_NAME = 'answer_options' THEN
+            SELECT q.version_id INTO v_old_version_id
+            FROM public.questions q
+            WHERE q.id = OLD.question_id;
+        END IF;
+
+        IF v_old_version_id IS NOT NULL THEN
+            SELECT status INTO v_old_status
+            FROM public.assessment_versions
+            WHERE id = v_old_version_id;
+
+            IF v_old_status IN ('published', 'archived') THEN
+                RAISE EXCEPTION 'Cannot % % on % assessment version (version_id: %). Content is immutable once published.',
+                    TG_OP, TG_TABLE_NAME, v_old_status, v_old_version_id;
+            END IF;
+        END IF;
     END IF;
 
-    IF v_version_id IS NOT NULL THEN
-        SELECT status INTO v_status
-        FROM public.assessment_versions
-        WHERE id = v_version_id;
+    -- 2. Resolve NEW parent version (for INSERT and UPDATE)
+    IF TG_OP IN ('INSERT', 'UPDATE') THEN
+        IF TG_TABLE_NAME = 'scoring_dimensions' THEN
+            v_new_version_id := NEW.version_id;
+        ELSIF TG_TABLE_NAME = 'questions' THEN
+            v_new_version_id := NEW.version_id;
+        ELSIF TG_TABLE_NAME = 'answer_options' THEN
+            SELECT q.version_id INTO v_new_version_id
+            FROM public.questions q
+            WHERE q.id = NEW.question_id;
+        END IF;
 
-        IF v_status IN ('published', 'archived') THEN
-            RAISE EXCEPTION 'Cannot % % on % assessment version (version_id: %). Content is immutable once published.',
-                TG_OP, TG_TABLE_NAME, v_status, v_version_id;
+        IF v_new_version_id IS NOT NULL THEN
+            SELECT status INTO v_new_status
+            FROM public.assessment_versions
+            WHERE id = v_new_version_id;
+
+            IF v_new_status IN ('published', 'archived') THEN
+                RAISE EXCEPTION 'Cannot % % into % assessment version (version_id: %). Content is immutable once published.',
+                    TG_OP, TG_TABLE_NAME, v_new_status, v_new_version_id;
+            END IF;
         END IF;
     END IF;
 
@@ -720,6 +749,7 @@ AS $$
 DECLARE
     v_order RECORD;
     v_report RECORD;
+    v_existing_payment RECORD;
     v_now TIMESTAMPTZ := timezone('utc'::text, now());
 BEGIN
     -- 1. Select and lock order row
@@ -744,7 +774,33 @@ BEGIN
             p_order_id, v_order.currency, p_currency;
     END IF;
 
-    -- 4. Check for idempotent already-paid state with payment conflict detection
+    -- 4. Check if payment transaction ID already exists in payments audit log
+    SELECT * INTO v_existing_payment
+    FROM public.payments
+    WHERE transaction_id = p_payment_id
+    FOR UPDATE;
+
+    IF FOUND THEN
+        -- Transaction already recorded. Verify it belongs strictly to this order
+        IF v_existing_payment.order_id != p_order_id THEN
+            RAISE EXCEPTION 'Payment transaction conflict: Transaction % already belongs to order %, cannot be reused for order %',
+                p_payment_id, v_existing_payment.order_id, p_order_id;
+        END IF;
+
+        -- Verify recorded amount matches
+        IF v_existing_payment.amount_paise != p_amount_paise THEN
+            RAISE EXCEPTION 'Payment transaction amount mismatch: Transaction % recorded with amount %, received %',
+                p_payment_id, v_existing_payment.amount_paise, p_amount_paise;
+        END IF;
+
+        -- Verify recorded currency matches
+        IF v_existing_payment.currency != p_currency THEN
+            RAISE EXCEPTION 'Payment transaction currency mismatch: Transaction % recorded with currency %, received %',
+                p_payment_id, v_existing_payment.currency, p_currency;
+        END IF;
+    END IF;
+
+    -- 5. Check for idempotent already-paid state with payment conflict detection
     IF v_order.status = 'paid' THEN
         -- If already paid, the incoming payment ID must match the recorded payment ID
         IF v_order.razorpay_payment_id IS NOT NULL AND v_order.razorpay_payment_id != p_payment_id THEN
@@ -1204,6 +1260,16 @@ BEGIN
     WHERE id = v_version.assessment_id
     FOR UPDATE;
 
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Assessment % not found for version %', v_version.assessment_id, p_version_id;
+    END IF;
+
+    -- Reject version number regression or duplicate published version number
+    IF v_version.version_number <= v_assessment.current_version THEN
+        RAISE EXCEPTION 'Version regression rejected: Target version number % must be strictly greater than current published version number % for assessment % (id: %).',
+            v_version.version_number, v_assessment.current_version, v_assessment.slug, v_assessment.id;
+    END IF;
+
     -- Archive existing published version(s) for this assessment
     UPDATE public.assessment_versions
     SET status = 'archived',
@@ -1242,6 +1308,21 @@ GRANT EXECUTE ON FUNCTION public.publish_assessment_version(UUID) TO service_rol
 -- ==============================================================================
 -- 12. EXPLICIT DATABASE PRIVILEGES & ACCESS CONTROL (LEAST PRIVILEGE)
 -- ==============================================================================
+
+-- 12.0 Explicit Schema-Level Privileges on Schema public
+-- Ensure PUBLIC has zero privileges on schema public
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+
+-- Ensure anon and authenticated have zero CREATE privileges on schema public
+REVOKE ALL ON SCHEMA public FROM anon, authenticated;
+REVOKE CREATE ON SCHEMA public FROM anon, authenticated;
+
+-- Grant USAGE strictly (needed for schema object resolution by legitimate client queries)
+GRANT USAGE ON SCHEMA public TO anon, authenticated;
+
+-- Grant full schema administration privileges strictly to service_role
+GRANT ALL ON SCHEMA public TO service_role;
 
 -- 12.1 Revoke default schema privileges from PUBLIC
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC;
