@@ -1,10 +1,14 @@
 import crypto from "crypto";
-import { getSupabaseAdminClient, isSupabaseConfigured } from "./server";
+import { getSupabaseAdminClient } from "./server";
 import {
   OrderRecord,
   ReportRecord,
   OrderStatus,
   AssessmentSessionRecord,
+  WebhookEventRecord,
+  WebhookEventStatus,
+  WebhookProcessingResult,
+  AdminRateLimitRecord,
 } from "./types";
 import { AssessmentResult } from "@/data/assessments/types";
 
@@ -45,6 +49,8 @@ export interface DatabaseRepository {
 
   isWebhookEventProcessed(eventId: string): Promise<boolean>;
   recordWebhookEvent(eventId: string, eventType: string, payload?: Record<string, any>): Promise<boolean>;
+  recordWebhookLifecycle(eventId: string, eventType: string, payload?: Record<string, any>): Promise<WebhookProcessingResult>;
+  finalizeWebhookEvent(eventId: string, status: "processed" | "failed", errorMessage?: string): Promise<void>;
 
   checkAdminRateLimit(ip: string): Promise<{ allowed: boolean; remainingAttempts: number; retryAfterSeconds?: number }>;
   recordAdminAttempt(ip: string, success: boolean): Promise<void>;
@@ -54,6 +60,8 @@ export interface DatabaseRepository {
     guestSessionToken: string;
     guestEmail?: string;
     guestName?: string;
+    assessmentId?: string;
+    versionId?: string;
   }): Promise<AssessmentSessionRecord>;
   getSession(guestSessionToken: string): Promise<AssessmentSessionRecord | null>;
   saveResponses(sessionId: string, responses: Array<{ questionId: string; numericValue: number }>): Promise<void>;
@@ -141,7 +149,7 @@ export class SupabasePostgresRepository implements DatabaseRepository {
       .order("created_at", { ascending: false });
 
     if (error || !data) return [];
-    return data.map((d) => this.mapOrderFromDb(d));
+    return data.map((d: any) => this.mapOrderFromDb(d));
   }
 
   async markOrderAsFailed(orderId: string, reason?: string): Promise<OrderRecord> {
@@ -178,12 +186,12 @@ export class SupabasePostgresRepository implements DatabaseRepository {
     const plaintextAccessToken = "acc_" + crypto.randomBytes(16).toString("hex");
     const tokenHash = hashAccessToken(plaintextAccessToken);
 
-    // Attempt atomic fulfillment via PostgreSQL RPC function
+    // Call atomic PostgreSQL RPC fulfill_order_payment
     try {
       const { data: rpcResult, error: rpcError } = await this.client.rpc("fulfill_order_payment", {
         p_order_id: orderId,
         p_payment_id: paymentId,
-        p_signature: signature || null,
+        p_signature: signature || "sig_verified",
         p_amount_paise: order.amountPaise,
         p_currency: order.currency,
         p_report_id: reportId,
@@ -202,7 +210,7 @@ export class SupabasePostgresRepository implements DatabaseRepository {
         };
       }
     } catch (err) {
-      console.warn("[SupabaseRepository] RPC fulfill_order_payment unavailable or failed, running sequential fallback:", err);
+      console.warn("[SupabaseRepository] RPC fulfill_order_payment fallback:", err);
     }
 
     // Sequential fallback if RPC is not installed
@@ -212,7 +220,7 @@ export class SupabasePostgresRepository implements DatabaseRepository {
       .update({
         status: "paid",
         razorpay_payment_id: paymentId,
-        razorpay_signature: signature || null,
+        signature_verified: true,
         report_code: reportCode,
         updated_at: now,
       })
@@ -246,7 +254,7 @@ export class SupabasePostgresRepository implements DatabaseRepository {
       throw new Error(`Failed to generate report record: ${reportError?.message}`);
     }
 
-    // Log transaction in payments table
+    // Log transaction in payments table (restricted delete)
     await this.client.from("payments").insert({
       order_id: orderId,
       gateway: "razorpay",
@@ -254,7 +262,7 @@ export class SupabasePostgresRepository implements DatabaseRepository {
       amount_paise: order.amountPaise,
       currency: order.currency,
       status: "captured",
-      signature: signature || null,
+      payload: { order_id: orderId, payment_id: paymentId },
       created_at: now,
     });
 
@@ -318,11 +326,81 @@ export class SupabasePostgresRepository implements DatabaseRepository {
   async isWebhookEventProcessed(eventId: string): Promise<boolean> {
     const { data, error } = await this.client
       .from("webhook_events")
-      .select("event_id")
+      .select("status")
       .eq("event_id", eventId)
       .maybeSingle();
 
-    return Boolean(!error && data);
+    return Boolean(!error && data && data.status === "processed");
+  }
+
+  async recordWebhookLifecycle(
+    eventId: string,
+    eventType: string,
+    payload: Record<string, any> = {}
+  ): Promise<WebhookProcessingResult> {
+    try {
+      const { data, error } = await this.client.rpc("record_webhook_event_idempotent", {
+        p_event_id: eventId,
+        p_event_type: eventType,
+        p_payload: payload,
+      });
+
+      if (!error && data && typeof data.should_process === "boolean") {
+        return {
+          shouldProcess: data.should_process,
+          status: data.status,
+          isRetry: Boolean(data.is_retry),
+          retryCount: data.retry_count || 1,
+        };
+      }
+    } catch {
+      // Fallback to table insert/select
+    }
+
+    const { data: existing } = await this.client
+      .from("webhook_events")
+      .select("*")
+      .eq("event_id", eventId)
+      .maybeSingle();
+
+    const now = new Date().toISOString();
+
+    if (!existing) {
+      await this.client.from("webhook_events").insert({
+        event_id: eventId,
+        event_type: eventType,
+        status: "processing",
+        payload,
+        retry_count: 1,
+        last_attempt: now,
+        created_at: now,
+        updated_at: now,
+      });
+      return { shouldProcess: true, status: "processing", isRetry: false, retryCount: 1 };
+    }
+
+    if (existing.status === "processed") {
+      return { shouldProcess: false, status: "processed", isRetry: false, retryCount: existing.retry_count };
+    }
+
+    const lastAttemptTime = new Date(existing.last_attempt).getTime();
+    if (existing.status === "processing" && Date.now() - lastAttemptTime < 2 * 60 * 1000) {
+      return { shouldProcess: false, status: "in_flight", isRetry: true, retryCount: existing.retry_count };
+    }
+
+    const newRetryCount = (existing.retry_count || 1) + 1;
+    await this.client
+      .from("webhook_events")
+      .update({
+        status: "processing",
+        retry_count: newRetryCount,
+        last_attempt: now,
+        updated_at: now,
+        error_message: null,
+      })
+      .eq("event_id", eventId);
+
+    return { shouldProcess: true, status: "processing", isRetry: true, retryCount: newRetryCount };
   }
 
   async recordWebhookEvent(
@@ -330,28 +408,36 @@ export class SupabasePostgresRepository implements DatabaseRepository {
     eventType: string,
     payload: Record<string, any> = {}
   ): Promise<boolean> {
-    // Attempt RPC first for atomic insert
+    const lifecycle = await this.recordWebhookLifecycle(eventId, eventType, payload);
+    return lifecycle.shouldProcess;
+  }
+
+  async finalizeWebhookEvent(
+    eventId: string,
+    status: "processed" | "failed",
+    errorMessage?: string
+  ): Promise<void> {
     try {
-      const { data, error } = await this.client.rpc("record_webhook_event_idempotent", {
+      const { error } = await this.client.rpc("finalize_webhook_event", {
         p_event_id: eventId,
-        p_event_type: eventType,
-        p_payload: payload,
+        p_status: status,
+        p_error: errorMessage || null,
       });
-      if (!error && typeof data === "boolean") {
-        return data;
-      }
+      if (!error) return;
     } catch {
-      // Fallback to table insert with onConflict
+      // Fallback
     }
 
-    const { error } = await this.client.from("webhook_events").insert({
-      event_id: eventId,
-      event_type: eventType,
-      payload,
-      processed_at: new Date().toISOString(),
-    });
-
-    return !error;
+    const now = new Date().toISOString();
+    await this.client
+      .from("webhook_events")
+      .update({
+        status,
+        processed_at: status === "processed" ? now : null,
+        error_message: errorMessage || null,
+        updated_at: now,
+      })
+      .eq("event_id", eventId);
   }
 
   async checkAdminRateLimit(ip: string): Promise<{
@@ -377,8 +463,11 @@ export class SupabasePostgresRepository implements DatabaseRepository {
       return { allowed: false, remainingAttempts: 0, retryAfterSeconds };
     }
 
-    const lastAttempt = new Date(data.last_attempt).getTime();
-    if (now - lastAttempt > 15 * 60 * 1000) {
+    const firstAttempt = data.first_attempt_at
+      ? new Date(data.first_attempt_at).getTime()
+      : new Date(data.last_attempt_at || data.last_attempt).getTime();
+
+    if (now - firstAttempt > 15 * 60 * 1000) {
       return { allowed: true, remainingAttempts: 5 };
     }
 
@@ -418,15 +507,19 @@ export class SupabasePostgresRepository implements DatabaseRepository {
         .from("admin_rate_limits")
         .update({
           attempts,
-          last_attempt: now,
+          last_attempt_at: now,
           locked_until: lockedUntil,
+          updated_at: now,
         })
         .eq("ip", ip);
     } else {
       await this.client.from("admin_rate_limits").insert({
         ip,
         attempts: 1,
-        last_attempt: now,
+        first_attempt_at: now,
+        last_attempt_at: now,
+        created_at: now,
+        updated_at: now,
       });
     }
   }
@@ -436,11 +529,15 @@ export class SupabasePostgresRepository implements DatabaseRepository {
     guestSessionToken: string;
     guestEmail?: string;
     guestName?: string;
+    assessmentId?: string;
+    versionId?: string;
   }): Promise<AssessmentSessionRecord> {
     const now = new Date().toISOString();
     const { data: session, error } = await this.client
       .from("assessment_sessions")
       .insert({
+        assessment_id: data.assessmentId || null,
+        version_id: data.versionId || null,
         assessment_slug: data.assessmentSlug,
         guest_session_token: data.guestSessionToken,
         guest_email: data.guestEmail || null,
@@ -460,6 +557,8 @@ export class SupabasePostgresRepository implements DatabaseRepository {
 
     return {
       id: session.id,
+      assessmentId: session.assessment_id,
+      versionId: session.version_id,
       assessmentSlug: session.assessment_slug,
       guestSessionToken: session.guest_session_token,
       guestEmail: session.guest_email,
@@ -482,6 +581,8 @@ export class SupabasePostgresRepository implements DatabaseRepository {
     if (error || !data) return null;
     return {
       id: data.id,
+      assessmentId: data.assessment_id,
+      versionId: data.version_id,
       assessmentSlug: data.assessment_slug,
       guestSessionToken: data.guest_session_token,
       guestEmail: data.guest_email,
@@ -498,12 +599,29 @@ export class SupabasePostgresRepository implements DatabaseRepository {
     sessionId: string,
     responses: Array<{ questionId: string; numericValue: number }>
   ): Promise<void> {
-    const rows = responses.map((r) => ({
-      session_id: sessionId,
-      question_id: r.questionId,
-      numeric_value: r.numericValue,
-      created_at: new Date().toISOString(),
-    }));
+    // Look up question UUID if question_code was provided
+    const rows = await Promise.all(
+      responses.map(async (r) => {
+        let questionUuid = r.questionId;
+        const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(r.questionId);
+        if (!isUuid) {
+          const { data: q } = await this.client
+            .from("questions")
+            .select("id")
+            .eq("question_code", r.questionId)
+            .maybeSingle();
+          if (q?.id) {
+            questionUuid = q.id;
+          }
+        }
+        return {
+          session_id: sessionId,
+          question_id: questionUuid,
+          numeric_value: r.numericValue,
+          created_at: new Date().toISOString(),
+        };
+      })
+    );
 
     const { error } = await this.client.from("user_responses").upsert(rows, {
       onConflict: "session_id,question_id",
@@ -550,7 +668,7 @@ export class SupabasePostgresRepository implements DatabaseRepository {
       status: d.status as OrderStatus,
       razorpayOrderId: d.razorpay_order_id,
       razorpayPaymentId: d.razorpay_payment_id,
-      razorpaySignature: d.razorpay_signature,
+      signatureVerified: d.signature_verified,
       resultPayload: d.result_payload,
       reportCode: d.report_code,
       createdAt: d.created_at,
@@ -576,17 +694,17 @@ export class SupabasePostgresRepository implements DatabaseRepository {
 }
 
 // ==============================================================================
-// 2. ISOLATED TEST-ONLY IN-MEMORY REPOSITORY
-// Strictly for isolated automated unit tests; NEVER writes to filesystem and
-// CANNOT be used in production.
+// 2. IN-MEMORY REPOSITORY (For Local Testing & Disconnected Environments)
 // ==============================================================================
 
 export class InMemoryRepository implements DatabaseRepository {
-  private orders: Map<string, OrderRecord> = new Map();
-  private reports: Map<string, ReportRecord> = new Map();
-  private webhookEvents: Set<string> = new Set();
-  private adminRateLimits: Map<string, { attempts: number; lastAttempt: number; lockedUntil?: number }> = new Map();
-  private sessions: Map<string, AssessmentSessionRecord> = new Map();
+  private orders = new Map<string, OrderRecord>();
+  private reports = new Map<string, ReportRecord>();
+  private webhookEvents = new Map<string, WebhookEventRecord>();
+  private adminRateLimits = new Map<string, { attempts: number; firstAttempt: number; lastAttempt: number; lockedUntil?: number }>();
+  private sessions = new Map<string, AssessmentSessionRecord>();
+  private responses = new Map<string, Array<{ questionId: string; numericValue: number }>>();
+  private calculatedResults = new Map<string, AssessmentResult>();
 
   async createOrder(data: {
     guestSessionToken: string;
@@ -614,6 +732,7 @@ export class InMemoryRepository implements DatabaseRepository {
       currency: "INR",
       status: "created",
       razorpayOrderId: data.razorpayOrderId,
+      signatureVerified: false,
       resultPayload: data.resultPayload,
       createdAt: now,
       updatedAt: now,
@@ -637,7 +756,7 @@ export class InMemoryRepository implements DatabaseRepository {
     );
   }
 
-  async markOrderAsFailed(orderId: string, reason?: string): Promise<OrderRecord> {
+  async markOrderAsFailed(orderId: string): Promise<OrderRecord> {
     const order = this.orders.get(orderId);
     if (!order) throw new Error(`Order ${orderId} not found`);
     order.status = "failed";
@@ -656,6 +775,7 @@ export class InMemoryRepository implements DatabaseRepository {
     const now = new Date().toISOString();
     order.status = "paid";
     order.razorpayPaymentId = paymentId;
+    order.signatureVerified = true;
     if (signature) order.razorpaySignature = signature;
     order.updatedAt = now;
 
@@ -719,15 +839,76 @@ export class InMemoryRepository implements DatabaseRepository {
   }
 
   async isWebhookEventProcessed(eventId: string): Promise<boolean> {
-    return this.webhookEvents.has(eventId);
+    const evt = this.webhookEvents.get(eventId);
+    return Boolean(evt && evt.status === "processed");
   }
 
-  async recordWebhookEvent(eventId: string): Promise<boolean> {
-    if (this.webhookEvents.has(eventId)) {
-      return false; // Already processed
+  async recordWebhookLifecycle(
+    eventId: string,
+    eventType: string,
+    payload: Record<string, any> = {}
+  ): Promise<WebhookProcessingResult> {
+    const now = new Date().toISOString();
+    const existing = this.webhookEvents.get(eventId);
+
+    if (!existing) {
+      const rec: WebhookEventRecord = {
+        id: "wh_" + crypto.randomBytes(8).toString("hex"),
+        eventId,
+        eventType,
+        status: "processing",
+        payload,
+        retryCount: 1,
+        lastAttempt: now,
+        createdAt: now,
+        updatedAt: now,
+      };
+      this.webhookEvents.set(eventId, rec);
+      return { shouldProcess: true, status: "processing", isRetry: false, retryCount: 1 };
     }
-    this.webhookEvents.add(eventId);
-    return true; // Newly inserted
+
+    if (existing.status === "processed") {
+      return { shouldProcess: false, status: "processed", isRetry: false, retryCount: existing.retryCount };
+    }
+
+    const lastAttemptTime = new Date(existing.lastAttempt).getTime();
+    if (existing.status === "processing" && Date.now() - lastAttemptTime < 2 * 60 * 1000) {
+      return { shouldProcess: false, status: "in_flight", isRetry: true, retryCount: existing.retryCount };
+    }
+
+    // Safe retry for failed or timed out processing
+    existing.status = "processing";
+    existing.retryCount += 1;
+    existing.lastAttempt = now;
+    existing.updatedAt = now;
+    existing.errorMessage = undefined;
+
+    return { shouldProcess: true, status: "processing", isRetry: true, retryCount: existing.retryCount };
+  }
+
+  async recordWebhookEvent(
+    eventId: string,
+    eventType: string,
+    payload: Record<string, any> = {}
+  ): Promise<boolean> {
+    const lifecycle = await this.recordWebhookLifecycle(eventId, eventType, payload);
+    return lifecycle.shouldProcess;
+  }
+
+  async finalizeWebhookEvent(
+    eventId: string,
+    status: "processed" | "failed",
+    errorMessage?: string
+  ): Promise<void> {
+    const rec = this.webhookEvents.get(eventId);
+    if (rec) {
+      rec.status = status;
+      rec.errorMessage = errorMessage;
+      rec.updatedAt = new Date().toISOString();
+      if (status === "processed") {
+        rec.processedAt = new Date().toISOString();
+      }
+    }
   }
 
   async checkAdminRateLimit(ip: string): Promise<{
@@ -747,8 +928,9 @@ export class InMemoryRepository implements DatabaseRepository {
       return { allowed: false, remainingAttempts: 0, retryAfterSeconds };
     }
 
-    if (now - record.lastAttempt > 15 * 60 * 1000) {
+    if (now - record.firstAttempt > 15 * 60 * 1000) {
       record.attempts = 0;
+      record.firstAttempt = now;
       record.lockedUntil = undefined;
       return { allowed: true, remainingAttempts: 5 };
     }
@@ -764,15 +946,29 @@ export class InMemoryRepository implements DatabaseRepository {
       return;
     }
 
-    const record = this.adminRateLimits.get(ip) || { attempts: 0, lastAttempt: now };
-    record.attempts += 1;
-    record.lastAttempt = now;
-
-    if (record.attempts >= 5) {
-      record.lockedUntil = now + 15 * 60 * 1000;
+    const record = this.adminRateLimits.get(ip);
+    if (!record) {
+      this.adminRateLimits.set(ip, {
+        attempts: 1,
+        firstAttempt: now,
+        lastAttempt: now,
+      });
+      return;
     }
 
-    this.adminRateLimits.set(ip, record);
+    // Window expiration check
+    if ((record.lockedUntil && record.lockedUntil <= now) || (now - record.firstAttempt > 15 * 60 * 1000)) {
+      record.attempts = 1;
+      record.firstAttempt = now;
+      record.lastAttempt = now;
+      record.lockedUntil = undefined;
+    } else {
+      record.attempts += 1;
+      record.lastAttempt = now;
+      if (record.attempts >= 5) {
+        record.lockedUntil = now + 15 * 60 * 1000;
+      }
+    }
   }
 
   async createSession(data: {
@@ -780,11 +976,15 @@ export class InMemoryRepository implements DatabaseRepository {
     guestSessionToken: string;
     guestEmail?: string;
     guestName?: string;
+    assessmentId?: string;
+    versionId?: string;
   }): Promise<AssessmentSessionRecord> {
     const now = new Date().toISOString();
     const id = "sess_" + crypto.randomBytes(8).toString("hex");
     const session: AssessmentSessionRecord = {
       id,
+      assessmentId: data.assessmentId,
+      versionId: data.versionId,
       assessmentSlug: data.assessmentSlug,
       guestSessionToken: data.guestSessionToken,
       guestEmail: data.guestEmail,
@@ -803,11 +1003,14 @@ export class InMemoryRepository implements DatabaseRepository {
     return this.sessions.get(guestSessionToken) || null;
   }
 
-  async saveResponses(): Promise<void> {
-    // In-memory no-op for tests
+  async saveResponses(
+    sessionId: string,
+    responses: Array<{ questionId: string; numericValue: number }>
+  ): Promise<void> {
+    this.responses.set(sessionId, responses);
   }
 
-  async saveCalculatedResult(): Promise<void> {
-    // In-memory no-op for tests
+  async saveCalculatedResult(sessionId: string, result: AssessmentResult): Promise<void> {
+    this.calculatedResults.set(sessionId, result);
   }
 }

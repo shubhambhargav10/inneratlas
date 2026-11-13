@@ -120,6 +120,14 @@ export const db = {
     return getActiveRepo().isWebhookEventProcessed(eventId);
   },
 
+  recordWebhookLifecycle(eventId: string, eventType: string, payload?: Record<string, any>) {
+    return getActiveRepo().recordWebhookLifecycle(eventId, eventType, payload);
+  },
+
+  finalizeWebhookEvent(eventId: string, status: "processed" | "failed", errorMessage?: string): Promise<void> {
+    return getActiveRepo().finalizeWebhookEvent(eventId, status, errorMessage);
+  },
+
   recordWebhookEvent(eventId: string, eventType: string, payload?: Record<string, any>): Promise<boolean> {
     return getActiveRepo().recordWebhookEvent(eventId, eventType, payload);
   },

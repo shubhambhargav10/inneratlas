@@ -1,82 +1,185 @@
 -- ==============================================================================
--- INNERATLAS PHASE 2 DATABASE MIGRATION
--- Production PostgreSQL Schema & Storage Engine for Supabase
+-- INNERATLAS PHASE 2 DATABASE MIGRATION (REMEDIATED & HARDENED)
+-- Production PostgreSQL Relational Schema, RLS Security & Storage Engine
 -- ==============================================================================
 
 -- 1. Enable Required Extensions
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
--- 2. USERS & PROFILES TABLE
+-- ==============================================================================
+-- 2. UTILITY TRIGGER FUNCTIONS
+-- ==============================================================================
+
+-- Auto-update updated_at timestamp
+CREATE OR REPLACE FUNCTION public.set_updated_at()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+    NEW.updated_at = timezone('utc'::text, now());
+    RETURN NEW;
+END;
+$$;
+
+-- Prevent non-service-role users from escalating profile role
+CREATE OR REPLACE FUNCTION public.prevent_profile_role_escalation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+    -- Only service_role or database superuser may alter the role column
+    IF (NEW.role IS DISTINCT FROM OLD.role) THEN
+        IF current_user != 'service_role' 
+           AND current_user != 'postgres' 
+           AND COALESCE(current_setting('request.jwt.claim.role', true), '') != 'service_role' THEN
+            RAISE EXCEPTION 'Unauthorized: Users cannot modify their own profile role or privileges.';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+-- ==============================================================================
+-- 3. CORE IDENTITY & USER PROFILES
+-- ==============================================================================
+
 CREATE TABLE IF NOT EXISTS public.profiles (
     id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
     email TEXT NOT NULL UNIQUE,
     full_name TEXT,
     avatar_url TEXT,
     role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'admin', 'super_admin')),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
 
--- 3. ASSESSMENTS CATALOGUE
+DROP TRIGGER IF EXISTS trg_profiles_updated_at ON public.profiles;
+CREATE TRIGGER trg_profiles_updated_at
+    BEFORE UPDATE ON public.profiles
+    FOR EACH ROW
+    EXECUTE FUNCTION public.set_updated_at();
+
+DROP TRIGGER IF EXISTS trg_prevent_profile_role_escalation ON public.profiles;
+CREATE TRIGGER trg_prevent_profile_role_escalation
+    BEFORE UPDATE ON public.profiles
+    FOR EACH ROW
+    EXECUTE FUNCTION public.prevent_profile_role_escalation();
+
+-- ==============================================================================
+-- 4. ASSESSMENT CATALOGUE & IMMUTABLE VERSIONS
+-- ==============================================================================
+
 CREATE TABLE IF NOT EXISTS public.assessments (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     slug TEXT NOT NULL UNIQUE,
     title TEXT NOT NULL,
     subtitle TEXT NOT NULL,
     description TEXT NOT NULL,
-    category TEXT NOT NULL, -- 'Personality', 'Career', 'Cognitive'
-    version INTEGER NOT NULL DEFAULT 1,
+    category TEXT NOT NULL CHECK (category IN ('Personality', 'Career', 'Cognitive')),
+    current_version INTEGER NOT NULL DEFAULT 1,
     estimated_minutes INTEGER NOT NULL DEFAULT 12,
-    price_inr INTEGER NOT NULL DEFAULT 199,
-    compare_price_inr INTEGER NOT NULL DEFAULT 499,
+    price_inr INTEGER NOT NULL DEFAULT 199 CHECK (price_inr > 0),
+    compare_price_inr INTEGER NOT NULL DEFAULT 499 CHECK (compare_price_inr >= price_inr),
     is_active BOOLEAN NOT NULL DEFAULT true,
     display_order INTEGER NOT NULL DEFAULT 1,
     cover_image TEXT,
     badge_label TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
 
--- 4. SCORING DIMENSIONS
+DROP TRIGGER IF EXISTS trg_assessments_updated_at ON public.assessments;
+CREATE TRIGGER trg_assessments_updated_at
+    BEFORE UPDATE ON public.assessments
+    FOR EACH ROW
+    EXECUTE FUNCTION public.set_updated_at();
+
+-- Immutable assessment versions preserve historical integrity
+CREATE TABLE IF NOT EXISTS public.assessment_versions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    assessment_id UUID NOT NULL REFERENCES public.assessments(id) ON DELETE RESTRICT,
+    version_number INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'published' CHECK (status IN ('draft', 'published', 'archived')),
+    changelog TEXT,
+    published_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
+    UNIQUE(assessment_id, version_number)
+);
+
+DROP TRIGGER IF EXISTS trg_assessment_versions_updated_at ON public.assessment_versions;
+CREATE TRIGGER trg_assessment_versions_updated_at
+    BEFORE UPDATE ON public.assessment_versions
+    FOR EACH ROW
+    EXECUTE FUNCTION public.set_updated_at();
+
+-- Scoring Dimensions tied to immutable assessment version
 CREATE TABLE IF NOT EXISTS public.scoring_dimensions (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    assessment_id UUID NOT NULL REFERENCES public.assessments(id) ON DELETE CASCADE,
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    version_id UUID NOT NULL REFERENCES public.assessment_versions(id) ON DELETE CASCADE,
     key TEXT NOT NULL,
     name TEXT NOT NULL,
     description TEXT NOT NULL,
     low_label TEXT NOT NULL,
     high_label TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(assessment_id, key)
+    display_order INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
+    UNIQUE(version_id, key)
 );
 
--- 5. QUESTIONS
+DROP TRIGGER IF EXISTS trg_scoring_dimensions_updated_at ON public.scoring_dimensions;
+CREATE TRIGGER trg_scoring_dimensions_updated_at
+    BEFORE UPDATE ON public.scoring_dimensions
+    FOR EACH ROW
+    EXECUTE FUNCTION public.set_updated_at();
+
+-- Questions tied to immutable assessment version
 CREATE TABLE IF NOT EXISTS public.questions (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    assessment_id UUID NOT NULL REFERENCES public.assessments(id) ON DELETE CASCADE,
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    version_id UUID NOT NULL REFERENCES public.assessment_versions(id) ON DELETE CASCADE,
+    question_code TEXT NOT NULL, -- Stable key, e.g. 'pa_q1'
     order_index INTEGER NOT NULL,
     question_text TEXT NOT NULL,
     context_hint TEXT,
     question_type TEXT NOT NULL DEFAULT 'likert_5' CHECK (question_type IN ('likert_5', 'single_choice')),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(assessment_id, order_index)
+    created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
+    UNIQUE(version_id, question_code),
+    UNIQUE(version_id, order_index)
 );
 
--- 6. ANSWER OPTIONS
+DROP TRIGGER IF EXISTS trg_questions_updated_at ON public.questions;
+CREATE TRIGGER trg_questions_updated_at
+    BEFORE UPDATE ON public.questions
+    FOR EACH ROW
+    EXECUTE FUNCTION public.set_updated_at();
+
+-- Answer Options with strictly confidential scoring weights
 CREATE TABLE IF NOT EXISTS public.answer_options (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     question_id UUID NOT NULL REFERENCES public.questions(id) ON DELETE CASCADE,
     order_index INTEGER NOT NULL,
     label TEXT NOT NULL,
     value INTEGER NOT NULL,
-    dimension_weights JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    dimension_weights JSONB NOT NULL DEFAULT '{}'::jsonb, -- Confidential internal scoring weights
+    created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
+    UNIQUE(question_id, order_index)
 );
 
--- 7. ASSESSMENT SESSIONS (Guest-First + Registered Users)
+-- ==============================================================================
+-- 5. SESSIONS, RESPONSES & RESULTS
+-- ==============================================================================
+
 CREATE TABLE IF NOT EXISTS public.assessment_sessions (
     id TEXT PRIMARY KEY DEFAULT ('sess_' || substr(md5(random()::text || clock_timestamp()::text), 1, 16)),
+    assessment_id UUID REFERENCES public.assessments(id) ON DELETE RESTRICT,
+    version_id UUID REFERENCES public.assessment_versions(id) ON DELETE RESTRICT,
     assessment_slug TEXT NOT NULL,
     user_id UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
     guest_session_token TEXT NOT NULL UNIQUE,
@@ -84,26 +187,32 @@ CREATE TABLE IF NOT EXISTS public.assessment_sessions (
     guest_name TEXT,
     status TEXT NOT NULL DEFAULT 'in_progress' CHECK (status IN ('in_progress', 'completed', 'abandoned')),
     current_question_index INTEGER NOT NULL DEFAULT 0,
-    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
     completed_at TIMESTAMPTZ,
     ip_hash TEXT,
     user_agent TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
 
--- 8. USER RESPONSES
+DROP TRIGGER IF EXISTS trg_assessment_sessions_updated_at ON public.assessment_sessions;
+CREATE TRIGGER trg_assessment_sessions_updated_at
+    BEFORE UPDATE ON public.assessment_sessions
+    FOR EACH ROW
+    EXECUTE FUNCTION public.set_updated_at();
+
+-- User responses with UUID type matching questions.id and foreign-key integrity
 CREATE TABLE IF NOT EXISTS public.user_responses (
     id TEXT PRIMARY KEY DEFAULT ('resp_' || substr(md5(random()::text || clock_timestamp()::text), 1, 16)),
     session_id TEXT NOT NULL REFERENCES public.assessment_sessions(id) ON DELETE CASCADE,
-    question_id TEXT NOT NULL,
-    numeric_value INTEGER NOT NULL,
-    response_time_ms INTEGER,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    question_id UUID NOT NULL REFERENCES public.questions(id) ON DELETE CASCADE,
+    numeric_value INTEGER NOT NULL CHECK (numeric_value BETWEEN 1 AND 5),
+    response_time_ms INTEGER CHECK (response_time_ms IS NULL OR response_time_ms >= 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
     UNIQUE(session_id, question_id)
 );
 
--- 9. CALCULATED RESULTS
+-- Calculated results for assessment sessions
 CREATE TABLE IF NOT EXISTS public.calculated_results (
     id TEXT PRIMARY KEY DEFAULT ('res_' || substr(md5(random()::text || clock_timestamp()::text), 1, 16)),
     session_id TEXT NOT NULL UNIQUE REFERENCES public.assessment_sessions(id) ON DELETE CASCADE,
@@ -115,14 +224,17 @@ CREATE TABLE IF NOT EXISTS public.calculated_results (
     executive_summary TEXT NOT NULL,
     preview_data JSONB NOT NULL DEFAULT '{}'::jsonb,
     full_report_data JSONB NOT NULL DEFAULT '{}'::jsonb,
-    calculated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    calculated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
 
--- 10. ORDERS
+-- ==============================================================================
+-- 6. ORDERS, PAYMENTS & REPORTS
+-- ==============================================================================
+
 CREATE TABLE IF NOT EXISTS public.orders (
     id TEXT PRIMARY KEY, -- e.g. ord_5922501fbd226785
     order_number TEXT NOT NULL UNIQUE, -- e.g. INA-839201
-    session_id TEXT,
+    session_id TEXT REFERENCES public.assessment_sessions(id) ON DELETE SET NULL,
     guest_session_token TEXT NOT NULL,
     assessment_slug TEXT NOT NULL,
     customer_name TEXT NOT NULL,
@@ -132,86 +244,131 @@ CREATE TABLE IF NOT EXISTS public.orders (
     status TEXT NOT NULL DEFAULT 'created' CHECK (status IN ('created', 'processing', 'paid', 'failed', 'refunded')),
     razorpay_order_id TEXT UNIQUE,
     razorpay_payment_id TEXT UNIQUE,
-    razorpay_signature TEXT,
+    signature_verified BOOLEAN NOT NULL DEFAULT false,
     result_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
     report_code TEXT UNIQUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
 
--- 11. PAYMENTS (Audit log of all gateway transactions)
+DROP TRIGGER IF EXISTS trg_orders_updated_at ON public.orders;
+CREATE TRIGGER trg_orders_updated_at
+    BEFORE UPDATE ON public.orders
+    FOR EACH ROW
+    EXECUTE FUNCTION public.set_updated_at();
+
+-- Financial audit trail: Immutable records. ON DELETE RESTRICT prevents loss of accounting records.
 CREATE TABLE IF NOT EXISTS public.payments (
     id TEXT PRIMARY KEY DEFAULT ('pay_tx_' || substr(md5(random()::text || clock_timestamp()::text), 1, 16)),
-    order_id TEXT NOT NULL REFERENCES public.orders(id) ON DELETE CASCADE,
+    order_id TEXT NOT NULL REFERENCES public.orders(id) ON DELETE RESTRICT,
     gateway TEXT NOT NULL DEFAULT 'razorpay',
     transaction_id TEXT NOT NULL UNIQUE, -- Razorpay Payment ID
     amount_paise INTEGER NOT NULL CHECK (amount_paise > 0),
     currency TEXT NOT NULL DEFAULT 'INR',
     status TEXT NOT NULL,
-    signature TEXT,
     payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
 
--- 12. REPORTS (Generated Dossiers with Cryptographic Access Token Hashing)
+-- Generated Dossiers with Cryptographic Access Token Hashing (SHA-256)
 CREATE TABLE IF NOT EXISTS public.reports (
     id TEXT PRIMARY KEY, -- e.g. rep_38a0bc7291fe928b
-    order_id TEXT NOT NULL UNIQUE REFERENCES public.orders(id) ON DELETE CASCADE,
+    order_id TEXT NOT NULL UNIQUE REFERENCES public.orders(id) ON DELETE RESTRICT,
     report_code TEXT NOT NULL UNIQUE, -- e.g. DOSSIER-839201
-    access_token_hash TEXT NOT NULL UNIQUE, -- Cryptographic SHA-256 hash of access token
+    access_token_hash TEXT NOT NULL UNIQUE, -- Cryptographic SHA-256 hash of plaintext access token
     customer_name TEXT NOT NULL,
     customer_email TEXT NOT NULL,
     assessment_slug TEXT NOT NULL,
     result_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
     page_count INTEGER NOT NULL DEFAULT 12,
     download_count INTEGER NOT NULL DEFAULT 0,
-    generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    generated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
 
--- 13. REPORT DOWNLOAD AUDIT LOGS
+-- Download Audit Logs
 CREATE TABLE IF NOT EXISTS public.report_downloads (
     id TEXT PRIMARY KEY DEFAULT ('dl_' || substr(md5(random()::text || clock_timestamp()::text), 1, 16)),
     report_id TEXT NOT NULL REFERENCES public.reports(id) ON DELETE CASCADE,
-    order_id TEXT NOT NULL REFERENCES public.orders(id) ON DELETE CASCADE,
-    downloaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    order_id TEXT NOT NULL REFERENCES public.orders(id) ON DELETE RESTRICT,
+    downloaded_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
     ip_hash TEXT,
     user_agent TEXT
 );
 
--- 14. WEBHOOK EVENTS (Database-backed deduplication and audit trail)
+-- ==============================================================================
+-- 7. WEBHOOK LIFECYCLE & DEDUPLICATION (State Machine: received/processing/processed/failed)
+-- ==============================================================================
+
 CREATE TABLE IF NOT EXISTS public.webhook_events (
     id TEXT PRIMARY KEY DEFAULT ('wh_' || substr(md5(random()::text || clock_timestamp()::text), 1, 16)),
     event_id TEXT NOT NULL UNIQUE, -- Razorpay Event ID (e.g. evt_xxxx)
     event_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'received' CHECK (status IN ('received', 'processing', 'processed', 'failed')),
     payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-    processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    error_message TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    last_attempt TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
+    processed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
 
--- 15. ADMINISTRATOR RATE LIMITING (Persistent & Concurrency-Safe across instances)
+DROP TRIGGER IF EXISTS trg_webhook_events_updated_at ON public.webhook_events;
+CREATE TRIGGER trg_webhook_events_updated_at
+    BEFORE UPDATE ON public.webhook_events
+    FOR EACH ROW
+    EXECUTE FUNCTION public.set_updated_at();
+
+-- ==============================================================================
+-- 8. ADMINISTRATOR RATE LIMITING (Persistent & Concurrency-Safe)
+-- ==============================================================================
+
 CREATE TABLE IF NOT EXISTS public.admin_rate_limits (
     ip TEXT PRIMARY KEY,
-    attempts INTEGER NOT NULL DEFAULT 0,
-    last_attempt TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    locked_until TIMESTAMPTZ
+    attempts INTEGER NOT NULL DEFAULT 1,
+    first_attempt_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
+    last_attempt_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
+    locked_until TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
 
--- 16. PERFORMANCE INDEXES
+DROP TRIGGER IF EXISTS trg_admin_rate_limits_updated_at ON public.admin_rate_limits;
+CREATE TRIGGER trg_admin_rate_limits_updated_at
+    BEFORE UPDATE ON public.admin_rate_limits
+    FOR EACH ROW
+    EXECUTE FUNCTION public.set_updated_at();
+
+-- ==============================================================================
+-- 9. PERFORMANCE & INTEGRITY INDEXES
+-- ==============================================================================
+
 CREATE INDEX IF NOT EXISTS idx_assessments_slug ON public.assessments(slug);
+CREATE INDEX IF NOT EXISTS idx_assessment_versions_lookup ON public.assessment_versions(assessment_id, status);
+CREATE INDEX IF NOT EXISTS idx_questions_version ON public.questions(version_id);
+CREATE INDEX IF NOT EXISTS idx_questions_code ON public.questions(version_id, question_code);
+CREATE INDEX IF NOT EXISTS idx_dimensions_version ON public.scoring_dimensions(version_id);
+CREATE INDEX IF NOT EXISTS idx_options_question ON public.answer_options(question_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_token ON public.assessment_sessions(guest_session_token);
+CREATE INDEX IF NOT EXISTS idx_sessions_assessment ON public.assessment_sessions(assessment_id, version_id);
+CREATE INDEX IF NOT EXISTS idx_responses_session ON public.user_responses(session_id);
 CREATE INDEX IF NOT EXISTS idx_orders_razorpay ON public.orders(razorpay_order_id);
 CREATE INDEX IF NOT EXISTS idx_orders_email ON public.orders(customer_email);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON public.orders(status);
+CREATE INDEX IF NOT EXISTS idx_payments_order ON public.payments(order_id);
 CREATE INDEX IF NOT EXISTS idx_reports_code ON public.reports(report_code);
 CREATE INDEX IF NOT EXISTS idx_reports_access_hash ON public.reports(access_token_hash);
 CREATE INDEX IF NOT EXISTS idx_webhook_event_id ON public.webhook_events(event_id);
+CREATE INDEX IF NOT EXISTS idx_webhook_status ON public.webhook_events(status);
 CREATE INDEX IF NOT EXISTS idx_admin_rate_ip ON public.admin_rate_limits(ip);
 
 -- ==============================================================================
--- 17. ROW LEVEL SECURITY (RLS) POLICIES
+-- 10. ROW LEVEL SECURITY (RLS) POLICIES & COLUMN PRIVILEGES
 -- ==============================================================================
 
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.assessments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.assessment_versions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.scoring_dimensions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.questions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.answer_options ENABLE ROW LEVEL SECURITY;
@@ -225,19 +382,89 @@ ALTER TABLE public.report_downloads ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.webhook_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.admin_rate_limits ENABLE ROW LEVEL SECURITY;
 
--- Catalog tables are publicly readable (anonymous can view assessments, questions, dimensions)
-CREATE POLICY "Public assessments read" ON public.assessments FOR SELECT USING (is_active = true);
-CREATE POLICY "Public dimensions read" ON public.scoring_dimensions FOR SELECT USING (true);
-CREATE POLICY "Public questions read" ON public.questions FOR SELECT USING (true);
-CREATE POLICY "Public answer options read" ON public.answer_options FOR SELECT USING (true);
+-- 10.1 Public Catalog Protection (Active & Published Only)
+CREATE POLICY "Public active assessments read" ON public.assessments
+    FOR SELECT USING (is_active = true);
 
--- User Profiles: users can read and update only their own profile
-CREATE POLICY "Users read own profile" ON public.profiles FOR SELECT USING (auth.uid() = id);
-CREATE POLICY "Users update own profile" ON public.profiles FOR UPDATE USING (auth.uid() = id);
+CREATE POLICY "Public published versions read" ON public.assessment_versions
+    FOR SELECT USING (
+        status = 'published'
+        AND EXISTS (
+            SELECT 1 FROM public.assessments a
+            WHERE a.id = assessment_versions.assessment_id AND a.is_active = true
+        )
+    );
 
--- Private tables: STRICT DEFAULT DENY for anonymous and public access
--- Server-side API endpoints use the Supabase Service Role Key which bypasses RLS securely.
--- Any direct public/anon access to customer orders, payments, reports, or webhooks is BLOCKED.
+CREATE POLICY "Public dimensions read" ON public.scoring_dimensions
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM public.assessment_versions av
+            JOIN public.assessments a ON a.id = av.assessment_id
+            WHERE av.id = scoring_dimensions.version_id
+              AND av.status = 'published'
+              AND a.is_active = true
+        )
+    );
+
+CREATE POLICY "Public questions read" ON public.questions
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM public.assessment_versions av
+            JOIN public.assessments a ON a.id = av.assessment_id
+            WHERE av.id = questions.version_id
+              AND av.status = 'published'
+              AND a.is_active = true
+        )
+    );
+
+CREATE POLICY "Public answer options read" ON public.answer_options
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM public.questions q
+            JOIN public.assessment_versions av ON av.id = q.version_id
+            JOIN public.assessments a ON a.id = av.assessment_id
+            WHERE q.id = answer_options.question_id
+              AND av.status = 'published'
+              AND a.is_active = true
+        )
+    );
+
+-- 10.2 Scoring Weights Confidentiality (Column-Level Access Control)
+-- Revoke all direct SELECT on answer_options from PUBLIC, anon, and authenticated
+REVOKE SELECT ON public.answer_options FROM PUBLIC, anon, authenticated;
+-- Grant SELECT ONLY on non-confidential columns to public clients
+GRANT SELECT (id, question_id, order_index, label, value, created_at) ON public.answer_options TO anon, authenticated;
+-- Grant full access strictly to trusted server-side role
+GRANT ALL ON public.answer_options TO service_role;
+
+-- Safe client view without dimension_weights
+CREATE OR REPLACE VIEW public.public_answer_options
+WITH (security_invoker = true)
+AS
+SELECT
+    id,
+    question_id,
+    order_index,
+    label,
+    value,
+    created_at
+FROM public.answer_options;
+
+-- 10.3 Profile Role Escalation Prevention in RLS
+CREATE POLICY "Users read own profile" ON public.profiles
+    FOR SELECT TO authenticated
+    USING (auth.uid() = id);
+
+CREATE POLICY "Users update own profile" ON public.profiles
+    FOR UPDATE TO authenticated
+    USING (auth.uid() = id)
+    WITH CHECK (
+        auth.uid() = id
+        AND role = (SELECT p.role FROM public.profiles p WHERE p.id = auth.uid())
+    );
+
+-- 10.4 Private Tables: STRICT DEFAULT DENY for Anonymous and Public Access
+-- All order queries, payments, reports, and rate limits MUST use service_role client on server
 CREATE POLICY "Deny anon orders select" ON public.orders FOR SELECT TO anon USING (false);
 CREATE POLICY "Deny anon orders insert" ON public.orders FOR INSERT TO anon WITH CHECK (false);
 CREATE POLICY "Deny anon orders update" ON public.orders FOR UPDATE TO anon USING (false);
@@ -248,10 +475,13 @@ CREATE POLICY "Deny anon webhook_events" ON public.webhook_events FOR ALL TO ano
 CREATE POLICY "Deny anon admin_rate_limits" ON public.admin_rate_limits FOR ALL TO anon USING (false);
 
 -- ==============================================================================
--- 18. ATOMIC DATABASE RPC FUNCTIONS
+-- 11. ATOMIC DATABASE RPC FUNCTIONS & PRIVILEGE HARDENING
 -- ==============================================================================
 
--- RPC 1: Fulfill Order Payment Atomically
+-- ------------------------------------------------------------------------------
+-- RPC 1: fulfill_order_payment
+-- Transactionally validates payment, marks order paid, records audit payment, and generates report record
+-- ------------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.fulfill_order_payment(
     p_order_id TEXT,
     p_payment_id TEXT,
@@ -266,11 +496,12 @@ CREATE OR REPLACE FUNCTION public.fulfill_order_payment(
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = public, pg_temp
 AS $$
 DECLARE
     v_order RECORD;
     v_report RECORD;
-    v_now TIMESTAMPTZ := NOW();
+    v_now TIMESTAMPTZ := timezone('utc'::text, now());
 BEGIN
     -- 1. Select and lock order row
     SELECT * INTO v_order
@@ -310,7 +541,7 @@ BEGIN
     UPDATE public.orders
     SET status = 'paid',
         razorpay_payment_id = p_payment_id,
-        razorpay_signature = p_signature,
+        signature_verified = true,
         report_code = p_report_code,
         updated_at = v_now
     WHERE id = p_order_id
@@ -347,7 +578,7 @@ BEGIN
         access_token_hash = EXCLUDED.access_token_hash
     RETURNING * INTO v_report;
 
-    -- 7. Record payment transaction in audit log
+    -- 7. Record payment transaction in audit log (immutable financial record)
     INSERT INTO public.payments (
         order_id,
         gateway,
@@ -355,7 +586,6 @@ BEGIN
         amount_paise,
         currency,
         status,
-        signature,
         payload,
         created_at
     ) VALUES (
@@ -365,8 +595,11 @@ BEGIN
         p_amount_paise,
         p_currency,
         'captured',
-        p_signature,
-        jsonb_build_object('order_id', p_order_id, 'payment_id', p_payment_id),
+        jsonb_build_object(
+            'order_id', p_order_id, 
+            'payment_id', p_payment_id,
+            'verified_at', v_now
+        ),
         v_now
     )
     ON CONFLICT (transaction_id) DO NOTHING;
@@ -382,27 +615,142 @@ BEGIN
 END;
 $$;
 
--- RPC 2: Record Webhook Event Idempotently
+-- Restrict fulfill_order_payment: ONLY service_role can execute
+REVOKE EXECUTE ON FUNCTION public.fulfill_order_payment(TEXT, TEXT, TEXT, INTEGER, TEXT, TEXT, TEXT, TEXT, INTEGER) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.fulfill_order_payment(TEXT, TEXT, TEXT, INTEGER, TEXT, TEXT, TEXT, TEXT, INTEGER) TO service_role;
+
+-- ------------------------------------------------------------------------------
+-- RPC 2: record_webhook_event_idempotent
+-- Implements robust webhook state machine: received -> processing -> processed / failed
+-- Supports safe retry on failure and concurrency locking
+-- ------------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.record_webhook_event_idempotent(
     p_event_id TEXT,
     p_event_type TEXT,
     p_payload JSONB DEFAULT '{}'::jsonb
 )
-RETURNS BOOLEAN
+RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = public, pg_temp
 AS $$
+DECLARE
+    v_existing RECORD;
+    v_now TIMESTAMPTZ := timezone('utc'::text, now());
 BEGIN
-    INSERT INTO public.webhook_events (event_id, event_type, payload, processed_at)
-    VALUES (p_event_id, p_event_type, p_payload, NOW());
-    RETURN true; -- Newly inserted
-EXCEPTION
-    WHEN unique_violation THEN
-        RETURN false; -- Already processed (duplicate event)
+    -- Select existing event with row-level lock
+    SELECT * INTO v_existing
+    FROM public.webhook_events
+    WHERE event_id = p_event_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        -- Brand new event: record as 'processing' with retry_count = 1
+        INSERT INTO public.webhook_events (
+            event_id, event_type, status, payload, retry_count, last_attempt, created_at, updated_at
+        ) VALUES (
+            p_event_id, p_event_type, 'processing', p_payload, 1, v_now, v_now, v_now
+        );
+        RETURN jsonb_build_object(
+            'should_process', true,
+            'status', 'processing',
+            'is_retry', false,
+            'retry_count', 1
+        );
+    END IF;
+
+    -- If event is already processed successfully, reject re-processing
+    IF v_existing.status = 'processed' THEN
+        RETURN jsonb_build_object(
+            'should_process', false,
+            'status', 'processed',
+            'is_retry', false,
+            'retry_count', v_existing.retry_count
+        );
+    END IF;
+
+    -- Concurrency check: If already in 'processing' within the last 2 minutes, avoid parallel race
+    IF v_existing.status = 'processing' AND v_existing.last_attempt > (v_now - INTERVAL '2 minutes') THEN
+        RETURN jsonb_build_object(
+            'should_process', false,
+            'status', 'in_flight',
+            'is_retry', true,
+            'retry_count', v_existing.retry_count
+        );
+    END IF;
+
+    -- Safe retry: If previous attempt failed (or timed out in 'processing' > 2 minutes)
+    UPDATE public.webhook_events
+    SET status = 'processing',
+        retry_count = v_existing.retry_count + 1,
+        last_attempt = v_now,
+        updated_at = v_now,
+        error_message = NULL
+    WHERE event_id = p_event_id;
+
+    RETURN jsonb_build_object(
+        'should_process', true,
+        'status', 'processing',
+        'is_retry', true,
+        'retry_count', v_existing.retry_count + 1
+    );
 END;
 $$;
 
--- RPC 3: Persistent Admin Rate Limiting
+-- Restrict record_webhook_event_idempotent: ONLY service_role can execute
+REVOKE EXECUTE ON FUNCTION public.record_webhook_event_idempotent(TEXT, TEXT, JSONB) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.record_webhook_event_idempotent(TEXT, TEXT, JSONB) TO service_role;
+
+-- ------------------------------------------------------------------------------
+-- RPC 3: finalize_webhook_event
+-- Transition webhook to final status: processed or failed
+-- ------------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.finalize_webhook_event(
+    p_event_id TEXT,
+    p_status TEXT,
+    p_error TEXT DEFAULT NULL
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+    v_now TIMESTAMPTZ := timezone('utc'::text, now());
+    v_updated RECORD;
+BEGIN
+    IF p_status NOT IN ('processed', 'failed') THEN
+        RAISE EXCEPTION 'Invalid final webhook status: %. Allowed: processed, failed', p_status;
+    END IF;
+
+    UPDATE public.webhook_events
+    SET status = p_status,
+        processed_at = CASE WHEN p_status = 'processed' THEN v_now ELSE NULL END,
+        error_message = p_error,
+        updated_at = v_now
+    WHERE event_id = p_event_id
+    RETURNING * INTO v_updated;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Webhook event % not found', p_event_id;
+    END IF;
+
+    RETURN jsonb_build_object(
+        'success', true,
+        'event_id', p_event_id,
+        'status', v_updated.status
+    );
+END;
+$$;
+
+-- Restrict finalize_webhook_event: ONLY service_role can execute
+REVOKE EXECUTE ON FUNCTION public.finalize_webhook_event(TEXT, TEXT, TEXT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.finalize_webhook_event(TEXT, TEXT, TEXT) TO service_role;
+
+-- ------------------------------------------------------------------------------
+-- RPC 4: check_and_record_admin_attempt
+-- Concurrency-safe atomic UPSERT with row-locking for administrator rate limiting
+-- ------------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.check_and_record_admin_attempt(
     p_ip TEXT,
     p_success BOOLEAN
@@ -410,70 +758,98 @@ CREATE OR REPLACE FUNCTION public.check_and_record_admin_attempt(
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = public, pg_temp
 AS $$
 DECLARE
+    v_now TIMESTAMPTZ := timezone('utc'::text, now());
     v_record RECORD;
-    v_now TIMESTAMPTZ := NOW();
-    v_locked_until TIMESTAMPTZ;
     v_remaining INTEGER;
 BEGIN
-    SELECT * INTO v_record
-    FROM public.admin_rate_limits
-    WHERE ip = p_ip
-    FOR UPDATE;
-
+    -- 1. If login succeeded, reset any failed attempts for this IP
     IF p_success THEN
-        -- Successful authentication resets failed attempts
         DELETE FROM public.admin_rate_limits WHERE ip = p_ip;
-        RETURN jsonb_build_object('allowed', true, 'remaining_attempts', 5);
+        RETURN jsonb_build_object(
+            'allowed', true,
+            'remaining_attempts', 5,
+            'retry_after_seconds', 0
+        );
     END IF;
 
-    IF FOUND THEN
-        -- Check if currently locked
-        IF v_record.locked_until IS NOT NULL AND v_record.locked_until > v_now THEN
-            RETURN jsonb_build_object(
-                'allowed', false,
-                'remaining_attempts', 0,
-                'retry_after_seconds', EXTRACT(EPOCH FROM (v_record.locked_until - v_now))::INTEGER
-            );
-        END IF;
+    -- 2. Concurrency-safe atomic UPSERT with row-level locking
+    INSERT INTO public.admin_rate_limits (
+        ip,
+        attempts,
+        first_attempt_at,
+        last_attempt_at,
+        locked_until,
+        created_at,
+        updated_at
+    ) VALUES (
+        p_ip,
+        1,
+        v_now,
+        v_now,
+        NULL,
+        v_now,
+        v_now
+    )
+    ON CONFLICT (ip) DO UPDATE SET
+        attempts = CASE
+            -- If currently locked and lockout expired: reset to 1
+            WHEN admin_rate_limits.locked_until IS NOT NULL AND admin_rate_limits.locked_until <= v_now
+                THEN 1
+            -- If 15-minute window expired since first attempt: reset to 1
+            WHEN admin_rate_limits.first_attempt_at + INTERVAL '15 minutes' < v_now
+                THEN 1
+            -- If currently locked and lockout is active: do not increment past max, keep locked
+            WHEN admin_rate_limits.locked_until IS NOT NULL AND admin_rate_limits.locked_until > v_now
+                THEN admin_rate_limits.attempts
+            -- Otherwise increment attempt counter
+            ELSE admin_rate_limits.attempts + 1
+        END,
+        first_attempt_at = CASE
+            WHEN (admin_rate_limits.locked_until IS NOT NULL AND admin_rate_limits.locked_until <= v_now)
+              OR (admin_rate_limits.first_attempt_at + INTERVAL '15 minutes' < v_now)
+                THEN v_now
+            ELSE admin_rate_limits.first_attempt_at
+        END,
+        last_attempt_at = v_now,
+        locked_until = CASE
+            -- If currently locked and still in lockout window: preserve lockout
+            WHEN admin_rate_limits.locked_until IS NOT NULL AND admin_rate_limits.locked_until > v_now
+                THEN admin_rate_limits.locked_until
+            -- If lock expired: clear lock
+            WHEN admin_rate_limits.locked_until IS NOT NULL AND admin_rate_limits.locked_until <= v_now
+                THEN NULL
+            -- If window expired: clear lock
+            WHEN admin_rate_limits.first_attempt_at + INTERVAL '15 minutes' < v_now
+                THEN NULL
+            -- If this attempt reaches or exceeds limit (>= 5 attempts): lock for 15 minutes
+            WHEN admin_rate_limits.attempts + 1 >= 5
+                THEN v_now + INTERVAL '15 minutes'
+            ELSE NULL
+        END,
+        updated_at = v_now
+    RETURNING * INTO v_record;
 
-        -- Reset window if last attempt was > 15 minutes ago
-        IF v_now - v_record.last_attempt > INTERVAL '15 minutes' THEN
-            UPDATE public.admin_rate_limits
-            SET attempts = 1,
-                last_attempt = v_now,
-                locked_until = NULL
-            WHERE ip = p_ip;
-            RETURN jsonb_build_object('allowed', true, 'remaining_attempts', 4);
-        END IF;
-
-        -- Increment attempts
-        IF v_record.attempts + 1 >= 5 THEN
-            v_locked_until := v_now + INTERVAL '15 minutes';
-            UPDATE public.admin_rate_limits
-            SET attempts = v_record.attempts + 1,
-                last_attempt = v_now,
-                locked_until = v_locked_until
-            WHERE ip = p_ip;
-            RETURN jsonb_build_object(
-                'allowed', false,
-                'remaining_attempts', 0,
-                'retry_after_seconds', 900
-            );
-        ELSE
-            UPDATE public.admin_rate_limits
-            SET attempts = v_record.attempts + 1,
-                last_attempt = v_now
-            WHERE ip = p_ip;
-            v_remaining := 5 - (v_record.attempts + 1);
-            RETURN jsonb_build_object('allowed', true, 'remaining_attempts', v_remaining);
-        END IF;
-    ELSE
-        -- First failed attempt
-        INSERT INTO public.admin_rate_limits (ip, attempts, last_attempt)
-        VALUES (p_ip, 1, v_now);
-        RETURN jsonb_build_object('allowed', true, 'remaining_attempts', 4);
+    -- 3. Calculate status and remaining attempts
+    IF v_record.locked_until IS NOT NULL AND v_record.locked_until > v_now THEN
+        RETURN jsonb_build_object(
+            'allowed', false,
+            'remaining_attempts', 0,
+            'retry_after_seconds', GREATEST(1, EXTRACT(EPOCH FROM (v_record.locked_until - v_now))::INTEGER)
+        );
     END IF;
+
+    v_remaining := GREATEST(0, 5 - v_record.attempts);
+    RETURN jsonb_build_object(
+        'allowed', v_remaining > 0,
+        'remaining_attempts', v_remaining,
+        'retry_after_seconds', 0
+    );
 END;
 $$;
+
+-- Restrict check_and_record_admin_attempt: ONLY service_role can execute
+REVOKE EXECUTE ON FUNCTION public.check_and_record_admin_attempt(TEXT, BOOLEAN) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.check_and_record_admin_attempt(TEXT, BOOLEAN) TO service_role;

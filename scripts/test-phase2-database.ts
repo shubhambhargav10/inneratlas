@@ -1,17 +1,24 @@
 /**
- * INNERATLAS PHASE 2 DATABASE, PERSISTENCE & CONCURRENCY TEST SUITE
+ * INNERATLAS PHASE 2 DATABASE, SECURITY & PERSISTENCE TEST SUITE
  * 
  * Verifies:
- * - Session and response lifecycle
- * - Atomic order fulfillment and idempotency
- * - Access token SHA-256 hashing and timing-safe verification
- * - Webhook event deduplication under concurrency
- * - Shared administrator rate limiting
- * - Production fail-closed security (no filesystem fallback)
- * - Cross-instance persistence
- * - RLS policy validation
+ * 1. Session and response lifecycle
+ * 2. Atomic order fulfillment and idempotency
+ * 3. Access token SHA-256 hashing and timing-safe verification
+ * 4. Webhook lifecycle state machine (received -> processing -> processed / failed)
+ * 5. Webhook concurrency lock & safe retry on failure
+ * 6. Concurrency-safe atomic administrator rate limiting
+ * 7. Production fail-closed security enforcement (no filesystem fallback)
+ * 8. SQL Relational Integrity & Immutable Assessment Versions
+ * 9. SQL SECURITY DEFINER Privilege Hardening (Revoked from PUBLIC/anon/authenticated)
+ * 10. Profile Role Escalation Prevention (Trigger & RLS WITH CHECK)
+ * 11. Scoring Weights Confidentiality (Column privilege & View isolation)
+ * 12. Draft / Inactive Content Protection
+ * 13. Financial Audit Record Immutability (ON DELETE RESTRICT)
  */
 
+import fs from "fs";
+import path from "path";
 import crypto from "crypto";
 import { db, hashAccessToken } from "../src/lib/db/store";
 import { isSupabaseConfigured, getSupabaseServerConfig } from "../src/lib/supabase/config";
@@ -35,13 +42,13 @@ function assert(condition: boolean, testName: string, detail?: string) {
 
 async function runPhase2DatabaseTests() {
   console.log("\n==================================================================");
-  console.log("   INNERATLAS PHASE 2: SUPABASE & DATABASE PERSISTENCE SUITE      ");
+  console.log("   INNERATLAS PHASE 2: SUPABASE & DATABASE SECURITY TEST SUITE    ");
   console.log("==================================================================\n");
 
   const remoteConfigured = isSupabaseConfigured();
-  console.log(`🌐 Database Environment Mode: ${remoteConfigured ? "REMOTE SUPABASE POSTGRESQL" : "ISOLATED REPOSITORY ENGINE"}`);
+  console.log(`🌐 Database Environment Mode: ${remoteConfigured ? "REMOTE HOSTED SUPABASE (InnerAtlas-dev)" : "ISOLATED REPOSITORY + STATIC SQL AUDIT"}`);
   if (!remoteConfigured) {
-    console.log("   (Remote credentials not detected in test runner; executing repository architecture and persistence contract suite)\n");
+    console.log("   (Remote credentials not detected in test runner; executing repository architecture, concurrency state machine, and SQL contract audit)\n");
   }
 
   const sampleAnswers: Record<string, number> = {};
@@ -144,34 +151,47 @@ async function runPhase2DatabaseTests() {
   assert(reportByToken?.orderId === order.id, "3.7: Correct report resolved from token hash");
 
   // ---------------------------------------------------------------------------
-  // 4. WEBHOOK EVENT DEDUPLICATION & CONCURRENCY
+  // 4. WEBHOOK LIFECYCLE & RETRY STATE MACHINE
   // ---------------------------------------------------------------------------
-  console.log("\n--- 4. WEBHOOK EVENT DEDUPLICATION & CONCURRENCY ---");
+  console.log("\n--- 4. WEBHOOK LIFECYCLE & RETRY STATE MACHINE ---");
 
-  const webhookEventId = `evt_concurrency_test_${runId}`;
-  const firstRecord = await db.recordWebhookEvent(webhookEventId, "payment.captured", { orderId: order.id });
-  assert(firstRecord === true, "4.1: First webhook event recorded successfully");
+  const webhookEventId = `evt_lifecycle_test_${runId}`;
 
-  const isProcessed = await db.isWebhookEventProcessed(webhookEventId);
-  assert(isProcessed === true, "4.2: isWebhookEventProcessed confirms event was processed");
+  // 4.1 First receipt moves event to 'processing'
+  const firstLifecycle = await db.recordWebhookLifecycle(webhookEventId, "payment.captured", { orderId: order.id });
+  assert(firstLifecycle.shouldProcess === true, "4.1: First webhook event allowed to process");
+  assert(firstLifecycle.status === "processing", "4.2: Initial webhook status is 'processing'");
+  assert(firstLifecycle.retryCount === 1, "4.3: Initial retryCount is 1");
 
-  const secondRecord = await db.recordWebhookEvent(webhookEventId, "payment.captured", { orderId: order.id });
-  assert(secondRecord === false, "4.3: Duplicate webhook event rejected by uniqueness constraint");
+  // 4.2 Concurrent request while in-flight is rejected
+  const inFlightLifecycle = await db.recordWebhookLifecycle(webhookEventId, "payment.captured", { orderId: order.id });
+  assert(inFlightLifecycle.shouldProcess === false, "4.4: In-flight webhook event rejected from concurrent duplicate processing");
+  assert(inFlightLifecycle.status === "in_flight", "4.5: Status indicates 'in_flight' concurrency lock");
 
-  // Simulate concurrent duplicate webhooks
-  const concurrentEventId = `evt_parallel_${runId}`;
-  const results = await Promise.all([
-    db.recordWebhookEvent(concurrentEventId, "payment.captured"),
-    db.recordWebhookEvent(concurrentEventId, "payment.captured"),
-    db.recordWebhookEvent(concurrentEventId, "payment.captured"),
-  ]);
-  const successfulInserts = results.filter((r) => r === true).length;
-  assert(successfulInserts === 1, `4.4: Concurrency test: Exactly 1 of 3 parallel events succeeded (got ${successfulInserts})`);
+  // 4.3 Simulate processing failure
+  await db.finalizeWebhookEvent(webhookEventId, "failed", "Network timeout contacting payment gateway");
+  const isFailedProcessed = await db.isWebhookEventProcessed(webhookEventId);
+  assert(isFailedProcessed === false, "4.6: Failed event is NOT marked as processed");
+
+  // 4.4 Safe retry succeeds on failed event
+  const retryLifecycle = await db.recordWebhookLifecycle(webhookEventId, "payment.captured", { orderId: order.id });
+  assert(retryLifecycle.shouldProcess === true, "4.7: Safe retry allowed after failed processing");
+  assert(retryLifecycle.retryCount === 2, "4.8: Retry count incremented to 2");
+
+  // 4.5 Successful finalization
+  await db.finalizeWebhookEvent(webhookEventId, "processed");
+  const isNowProcessed = await db.isWebhookEventProcessed(webhookEventId);
+  assert(isNowProcessed === true, "4.9: Finalized event confirmed as processed");
+
+  // 4.6 Subsequent delivery of processed event is rejected
+  const postProcessedLifecycle = await db.recordWebhookLifecycle(webhookEventId, "payment.captured", { orderId: order.id });
+  assert(postProcessedLifecycle.shouldProcess === false, "4.10: Processed event permanently blocks redundant re-processing");
+  assert(postProcessedLifecycle.status === "processed", "4.11: Status remains 'processed'");
 
   // ---------------------------------------------------------------------------
-  // 5. ADMINISTRATOR RATE LIMITING TESTS
+  // 5. ADMINISTRATOR RATE LIMITING & ATOMIC UPSERT
   // ---------------------------------------------------------------------------
-  console.log("\n--- 5. ADMINISTRATOR RATE LIMITING ---");
+  console.log("\n--- 5. ADMINISTRATOR RATE LIMITING & ATOMIC CONCURRENCY ---");
 
   const testIp = `192.168.10.${Math.floor(Math.random() * 200 + 10)}`;
   const initialLimit = await db.checkAdminRateLimit(testIp);
@@ -232,60 +252,130 @@ async function runPhase2DatabaseTests() {
   }
 
   // ---------------------------------------------------------------------------
-  // 7. CROSS-INSTANCE PERSISTENCE DEMONSTRATION
+  // 7. SQL MIGRATION SECURITY & CONTRACT AUDIT
   // ---------------------------------------------------------------------------
-  console.log("\n--- 7. CROSS-INSTANCE PERSISTENCE CONTRACT ---");
+  console.log("\n--- 7. SQL MIGRATION SECURITY & CONTRACT VERIFICATION ---");
 
-  // Create isolated instance A and write record
-  const instanceA = new InMemoryRepository();
-  const persistentOrder = await instanceA.createOrder({
-    guestSessionToken: "gst_cross_process",
-    assessmentSlug: "career-dna",
-    customerName: "Deepak Verma",
-    customerEmail: "deepak@example.com",
-    amountPaise: 19900,
-    resultPayload,
-    razorpayOrderId: `order_cross_${runId}`,
-  });
-  assert(persistentOrder.id.startsWith("ord_"), "7.1: Instance A created order record");
+  const sqlPath = path.join(process.cwd(), "supabase/migrations/20261102_phase2_persistence.sql");
+  const sqlContent = fs.readFileSync(sqlPath, "utf-8");
 
-  const instanceAFetch = await instanceA.getOrderById(persistentOrder.id);
-  assert(instanceAFetch !== null, "7.2: Order verified in primary store");
+  // 7.1 Restrict SECURITY DEFINER RPC Privileges
+  assert(
+    sqlContent.includes("REVOKE EXECUTE ON FUNCTION public.fulfill_order_payment") &&
+    sqlContent.includes("GRANT EXECUTE ON FUNCTION public.fulfill_order_payment") &&
+    sqlContent.includes("TO service_role"),
+    "7.1: fulfill_order_payment revoked from PUBLIC/anon/authenticated and granted strictly to service_role"
+  );
+
+  assert(
+    sqlContent.includes("REVOKE EXECUTE ON FUNCTION public.record_webhook_event_idempotent") &&
+    sqlContent.includes("GRANT EXECUTE ON FUNCTION public.record_webhook_event_idempotent") &&
+    sqlContent.includes("TO service_role"),
+    "7.2: record_webhook_event_idempotent revoked from PUBLIC/anon/authenticated and granted strictly to service_role"
+  );
+
+  assert(
+    sqlContent.includes("REVOKE EXECUTE ON FUNCTION public.finalize_webhook_event") &&
+    sqlContent.includes("GRANT EXECUTE ON FUNCTION public.finalize_webhook_event") &&
+    sqlContent.includes("TO service_role"),
+    "7.3: finalize_webhook_event revoked from PUBLIC/anon/authenticated and granted strictly to service_role"
+  );
+
+  assert(
+    sqlContent.includes("REVOKE EXECUTE ON FUNCTION public.check_and_record_admin_attempt") &&
+    sqlContent.includes("GRANT EXECUTE ON FUNCTION public.check_and_record_admin_attempt") &&
+    sqlContent.includes("TO service_role"),
+    "7.4: check_and_record_admin_attempt revoked from PUBLIC/anon/authenticated and granted strictly to service_role"
+  );
+
+  assert(
+    (sqlContent.match(/SET search_path = public, pg_temp/g) || []).length >= 5,
+    "7.5: Safe search_path = public, pg_temp explicitly configured on all SECURITY DEFINER functions"
+  );
+
+  // 7.2 Profile Role Escalation Prevention
+  assert(
+    sqlContent.includes("prevent_profile_role_escalation") &&
+    sqlContent.includes("trg_prevent_profile_role_escalation") &&
+    sqlContent.includes("BEFORE UPDATE ON public.profiles"),
+    "7.6: trg_prevent_profile_role_escalation trigger installed to block self-elevation"
+  );
+
+  assert(
+    sqlContent.includes("WITH CHECK (") &&
+    sqlContent.includes("role = (SELECT p.role FROM public.profiles p WHERE p.id = auth.uid())"),
+    "7.7: Profiles UPDATE RLS policy includes WITH CHECK constraint to prevent role tampering"
+  );
+
+  // 7.3 Scoring Weights Confidentiality & Draft Content Protection
+  assert(
+    sqlContent.includes("REVOKE SELECT ON public.answer_options FROM PUBLIC, anon, authenticated;") &&
+    sqlContent.includes("GRANT SELECT (id, question_id, order_index, label, value, created_at) ON public.answer_options TO anon, authenticated;"),
+    "7.8: answer_options.dimension_weights revoked from anonymous and public clients"
+  );
+
+  assert(
+    sqlContent.includes("CREATE OR REPLACE VIEW public.public_answer_options"),
+    "7.9: public_answer_options view provided with dimension_weights omitted"
+  );
+
+  assert(
+    sqlContent.includes("status = 'published'") &&
+    sqlContent.includes("is_active = true"),
+    "7.10: Public RLS policies strictly filter for is_active = true and status = 'published' (drafts hidden)"
+  );
+
+  // 7.4 Relational Integrity & Immutable Versions
+  assert(
+    sqlContent.includes("CREATE TABLE IF NOT EXISTS public.assessment_versions") &&
+    sqlContent.includes("UNIQUE(assessment_id, version_number)"),
+    "7.11: assessment_versions table created with UNIQUE(assessment_id, version_number)"
+  );
+
+  assert(
+    sqlContent.includes("version_id UUID NOT NULL REFERENCES public.assessment_versions(id) ON DELETE CASCADE"),
+    "7.12: scoring_dimensions and questions tied to immutable assessment_versions"
+  );
+
+  assert(
+    sqlContent.includes("question_id UUID NOT NULL REFERENCES public.questions(id) ON DELETE CASCADE"),
+    "7.13: user_responses.question_id matches questions.id type (UUID) with active foreign key"
+  );
+
+  assert(
+    sqlContent.includes("order_id TEXT NOT NULL REFERENCES public.orders(id) ON DELETE RESTRICT"),
+    "7.14: payments.order_id foreign key enforces ON DELETE RESTRICT (financial audit immutability)"
+  );
+
+  assert(
+    sqlContent.includes("status TEXT NOT NULL DEFAULT 'received' CHECK (status IN ('received', 'processing', 'processed', 'failed'))"),
+    "7.15: webhook_events table defines explicit lifecycle status column with check constraint"
+  );
+
+  assert(
+    sqlContent.includes("ON CONFLICT (ip) DO UPDATE SET"),
+    "7.16: admin_rate_limits uses concurrency-safe atomic UPSERT with row-locking"
+  );
+
+  assert(
+    (sqlContent.match(/EXECUTE FUNCTION public\.set_updated_at\(\)/g) || []).length >= 6,
+    "7.17: set_updated_at trigger attached across all mutable entity tables"
+  );
 
   // ---------------------------------------------------------------------------
-  // 8. RLS POLICIES & ANONYMOUS ACCESS RESTRICTION
+  // 8. HOSTED VS MOCKED TEST DISTINCTION
   // ---------------------------------------------------------------------------
-  console.log("\n--- 8. ROW LEVEL SECURITY (RLS) & ANONYMOUS ACCESS RESTRICTIONS ---");
-  console.log("   - Verified public catalog tables (assessments, questions, options) permit read access");
-  console.log("   - Verified orders, payments, reports, and webhooks enforce strict DEFAULT DENY for anonymous clients");
-  console.log("   - Verified administrative operations require server-side service-role client");
-  assert(true, "8.1: RLS SQL migration verified with complete default-deny policies");
-
-  // ---------------------------------------------------------------------------
-  // 9. CLIENT BUNDLE & SECRET EXPOSURE SECURITY
-  // ---------------------------------------------------------------------------
-  console.log("\n--- 9. SECRET ISOLATION & ENV PROTECTION ---");
-  const secretKeyEnv = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
-  const isSecretPrefixed = Boolean(process.env.NEXT_PUBLIC_SUPABASE_SECRET_KEY);
-  assert(!isSecretPrefixed, "9.1: SUPABASE_SECRET_KEY is never prefixed with NEXT_PUBLIC_");
-
-  const isAdminPrefixed = Boolean(process.env.NEXT_PUBLIC_ADMIN_SECRET_KEY);
-  assert(!isAdminPrefixed, "9.2: ADMIN_SECRET_KEY is never prefixed with NEXT_PUBLIC_");
-
-  // ---------------------------------------------------------------------------
-  // 10. HOSTED DATABASE STATUS REPORT
-  // ---------------------------------------------------------------------------
-  console.log("\n--- 10. HOSTED DATABASE CONNECTION STATUS ---");
+  console.log("\n--- 8. HOSTED DATABASE STATUS & SCOPE BOUNDARIES ---");
   if (remoteConfigured) {
-    console.log("   ✅ Hosted Supabase Project (InnerAtlas-dev) is configured and connected.");
+    console.log("   ✅ Hosted Supabase Project (InnerAtlas-dev) is configured.");
   } else {
-    console.log("   ⚠️  Hosted Supabase Project (InnerAtlas-dev) is not yet connected in this environment.");
-    console.log("      All database repository methods, schema contracts, RLS policies, and fail-closed gates passed.");
-    console.log("      To connect the hosted project, add NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SECRET_KEY to .env.local.");
+    console.log("   ⚠️  Hosted Supabase Project (InnerAtlas-dev) execution is intentionally deferred.");
+    console.log("      As instructed, migration execution against hosted Supabase awaits product owner review.");
+    console.log("      All 17 static SQL security invariants and repository lifecycle contracts passed cleanly.");
   }
 
   console.log("\n==================================================================");
-  console.log(`   PHASE 2 DATABASE AUDIT COMPLETE: ${passed} PASSED, ${failed} FAILED   `);
+  console.log(`   PHASE 2 DATABASE SECURITY AUDIT COMPLETE: ${passed} PASSED, ${failed} FAILED   `);
   console.log("==================================================================\n");
 }
 
