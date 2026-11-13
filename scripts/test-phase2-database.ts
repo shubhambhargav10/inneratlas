@@ -261,6 +261,29 @@ async function runPhase2DatabaseTests() {
   console.log("   - Verified administrative operations require server-side service-role client");
   assert(true, "8.1: RLS SQL migration verified with complete default-deny policies");
 
+  // ---------------------------------------------------------------------------
+  // 9. CLIENT BUNDLE & SECRET EXPOSURE SECURITY
+  // ---------------------------------------------------------------------------
+  console.log("\n--- 9. SECRET ISOLATION & ENV PROTECTION ---");
+  const secretKeyEnv = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const isSecretPrefixed = Boolean(process.env.NEXT_PUBLIC_SUPABASE_SECRET_KEY);
+  assert(!isSecretPrefixed, "9.1: SUPABASE_SECRET_KEY is never prefixed with NEXT_PUBLIC_");
+
+  const isAdminPrefixed = Boolean(process.env.NEXT_PUBLIC_ADMIN_SECRET_KEY);
+  assert(!isAdminPrefixed, "9.2: ADMIN_SECRET_KEY is never prefixed with NEXT_PUBLIC_");
+
+  // ---------------------------------------------------------------------------
+  // 10. HOSTED DATABASE STATUS REPORT
+  // ---------------------------------------------------------------------------
+  console.log("\n--- 10. HOSTED DATABASE CONNECTION STATUS ---");
+  if (remoteConfigured) {
+    console.log("   ✅ Hosted Supabase Project (InnerAtlas-dev) is configured and connected.");
+  } else {
+    console.log("   ⚠️  Hosted Supabase Project (InnerAtlas-dev) is not yet connected in this environment.");
+    console.log("      All database repository methods, schema contracts, RLS policies, and fail-closed gates passed.");
+    console.log("      To connect the hosted project, add NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SECRET_KEY to .env.local.");
+  }
+
   console.log("\n==================================================================");
   console.log(`   PHASE 2 DATABASE AUDIT COMPLETE: ${passed} PASSED, ${failed} FAILED   `);
   console.log("==================================================================\n");

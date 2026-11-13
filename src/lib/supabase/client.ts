@@ -13,9 +13,9 @@ export function getSupabaseBrowserClient(): SupabaseClient {
     return cachedBrowserClient;
   }
 
-  const { url, anonKey } = getSupabasePublicConfig();
+  const { url, publishableKey } = getSupabasePublicConfig();
 
-  cachedBrowserClient = createClient(url, anonKey, {
+  cachedBrowserClient = createClient(url, publishableKey, {
     auth: {
       persistSession: true,
       autoRefreshToken: true,

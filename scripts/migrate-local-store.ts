@@ -41,7 +41,7 @@ async function runMigration() {
 
   if (!isSupabaseConfigured()) {
     console.error("❌ Supabase PostgreSQL is not configured.");
-    console.error("   Ensure NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are set in your environment.");
+    console.error("   Ensure NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SECRET_KEY are set in your environment.");
     process.exit(1);
   }
 
