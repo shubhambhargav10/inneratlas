@@ -305,8 +305,8 @@ export class SupabasePostgresRepository implements DatabaseRepository {
       throw new Error(`Failed to generate report record: ${reportError?.message}`);
     }
 
-    // Log transaction in payments table (restricted delete)
-    await this.client.from("payments").insert({
+    // Log transaction in payments table (restricted delete) with conflict handling
+    const { error: paymentInsertError } = await this.client.from("payments").insert({
       order_id: orderId,
       gateway: "razorpay",
       transaction_id: paymentId,
@@ -316,6 +316,19 @@ export class SupabasePostgresRepository implements DatabaseRepository {
       payload: { order_id: orderId, payment_id: paymentId },
       created_at: now,
     });
+
+    if (paymentInsertError) {
+      const { data: winningPayment } = await this.client
+        .from("payments")
+        .select("order_id")
+        .eq("transaction_id", paymentId)
+        .maybeSingle();
+      if (winningPayment && winningPayment.order_id !== orderId) {
+        throw new Error(
+          `Payment transaction conflict: Transaction ${paymentId} already claimed by order ${winningPayment.order_id}, cannot be reused for order ${orderId}`
+        );
+      }
+    }
 
     return {
       order: this.mapOrderFromDb(updatedOrderData),
@@ -894,6 +907,7 @@ export class SupabasePostgresRepository implements DatabaseRepository {
 
 export class InMemoryRepository implements DatabaseRepository {
   private orders = new Map<string, OrderRecord>();
+  private payments = new Map<string, { id: string; orderId: string; amountPaise: number; currency: string }>();
   private reports = new Map<string, ReportRecord>();
   private webhookEvents = new Map<string, WebhookEventRecord>();
   private adminRateLimits = new Map<string, { attempts: number; firstAttempt: number; lastAttempt: number; lockedUntil?: number }>();
@@ -1009,6 +1023,23 @@ export class InMemoryRepository implements DatabaseRepository {
     const reportCode = "DOSSIER-" + Math.floor(100000 + Math.random() * 900000);
     const plaintextAccessToken = "acc_" + crypto.randomBytes(16).toString("hex");
     const tokenHash = hashAccessToken(plaintextAccessToken);
+
+    // Record payment in audit log with concurrent race protection
+    if (!this.payments.has(paymentId)) {
+      this.payments.set(paymentId, {
+        id: "pay_" + crypto.randomBytes(8).toString("hex"),
+        orderId: order.id,
+        amountPaise: order.amountPaise,
+        currency: order.currency,
+      });
+    } else {
+      const winningPayment = this.payments.get(paymentId)!;
+      if (winningPayment.orderId !== orderId) {
+        throw new Error(
+          `Payment transaction conflict: Transaction ${paymentId} already claimed by order ${winningPayment.orderId}, cannot be reused for order ${orderId}`
+        );
+      }
+    }
 
     const report: ReportRecord = {
       id: reportId,

@@ -750,6 +750,7 @@ DECLARE
     v_order RECORD;
     v_report RECORD;
     v_existing_payment RECORD;
+    v_inserted_payment_id TEXT;
     v_now TIMESTAMPTZ := timezone('utc'::text, now());
 BEGIN
     -- 1. Select and lock order row
@@ -860,6 +861,7 @@ BEGIN
     RETURNING * INTO v_report;
 
     -- 7. Record payment transaction in audit log (immutable financial record)
+    -- Handles concurrent race on previously unseen transaction IDs via ON CONFLICT DO NOTHING + RETURNING
     INSERT INTO public.payments (
         order_id,
         gateway,
@@ -883,7 +885,34 @@ BEGIN
         ),
         v_now
     )
-    ON CONFLICT (transaction_id) DO NOTHING;
+    ON CONFLICT (transaction_id) DO NOTHING
+    RETURNING id INTO v_inserted_payment_id;
+
+    -- If another concurrent transaction inserted the same transaction_id first,
+    -- lock and verify the winning record to prevent cross-order transaction reuse
+    IF v_inserted_payment_id IS NULL THEN
+        SELECT * INTO v_existing_payment
+        FROM public.payments
+        WHERE transaction_id = p_payment_id
+        FOR UPDATE;
+
+        IF FOUND THEN
+            IF v_existing_payment.order_id != p_order_id THEN
+                RAISE EXCEPTION 'Payment transaction conflict: Transaction % already claimed by order %, cannot be reused for order %',
+                    p_payment_id, v_existing_payment.order_id, p_order_id;
+            END IF;
+
+            IF v_existing_payment.amount_paise != p_amount_paise THEN
+                RAISE EXCEPTION 'Payment transaction amount mismatch: Transaction % recorded with amount %, received %',
+                    p_payment_id, v_existing_payment.amount_paise, p_amount_paise;
+            END IF;
+
+            IF v_existing_payment.currency != p_currency THEN
+                RAISE EXCEPTION 'Payment transaction currency mismatch: Transaction % recorded with currency %, received %',
+                    p_payment_id, v_existing_payment.currency, p_currency;
+            END IF;
+        END IF;
+    END IF;
 
     RETURN jsonb_build_object(
         'success', true,

@@ -787,6 +787,41 @@ async function runPhase2DatabaseTests() {
   const replayedOrderA = await memRepo.markOrderAsPaid(orderA.id, txIdUnique);
   assert(replayedOrderA.order.status === "paid" && replayedOrderA.order.razorpayPaymentId === txIdUnique, "7.38: Idempotent re-fulfillment of Order A succeeds");
 
+  // Concurrent race test: Two different orders attempting to use the same previously unseen transaction ID simultaneously
+  const orderC = await memRepo.createOrder({
+    guestSessionToken: `gst_pay_order_c_${runId}`,
+    assessmentSlug: "thinking-style",
+    customerName: "Order C Customer",
+    customerEmail: `order_c_${runId}@example.com`,
+    amountPaise: 19900,
+    resultPayload: { archetype: "Systemic" } as any,
+  });
+  const orderD = await memRepo.createOrder({
+    guestSessionToken: `gst_pay_order_d_${runId}`,
+    assessmentSlug: "thinking-style",
+    customerName: "Order D Customer",
+    customerEmail: `order_d_${runId}@example.com`,
+    amountPaise: 19900,
+    resultPayload: { archetype: "Systemic" } as any,
+  });
+
+  const txIdRace = `pay_tx_unseen_race_${runId}`;
+  const raceResults = await Promise.allSettled([
+    memRepo.markOrderAsPaid(orderC.id, txIdRace),
+    memRepo.markOrderAsPaid(orderD.id, txIdRace),
+  ]);
+
+  const fulfilledCount = raceResults.filter((r) => r.status === "fulfilled").length;
+  const rejectedCount = raceResults.filter((r) => r.status === "rejected").length;
+  const rejectedReason = raceResults.find((r) => r.status === "rejected") as PromiseRejectedResult | undefined;
+
+  assert(fulfilledCount === 1, "7.39: Exactly one order wins fulfillment for unseen transaction ID in concurrent race");
+  assert(
+    rejectedCount === 1 &&
+    Boolean(rejectedReason?.reason?.message?.includes("Payment transaction conflict")),
+    "7.40: Competing order rejected with Payment transaction conflict during simultaneous race"
+  );
+
   // ---------------------------------------------------------------------------
   // 8. SQL MIGRATION SECURITY & CONTRACT VERIFICATION
   // ---------------------------------------------------------------------------
@@ -1064,6 +1099,19 @@ async function runPhase2DatabaseTests() {
     sqlContent.includes("GRANT USAGE ON SCHEMA public TO anon, authenticated;") &&
     sqlContent.includes("GRANT ALL ON SCHEMA public TO service_role;"),
     "8.38: Schema-level privileges explicitly revoke CREATE and ALL from PUBLIC/anon/authenticated and grant USAGE strictly"
+  );
+
+  // 8.14 Payment Concurrency Race on Unseen Transaction IDs
+  assert(
+    sqlContent.includes("ON CONFLICT (transaction_id) DO NOTHING") &&
+    sqlContent.includes("RETURNING id INTO v_inserted_payment_id;") &&
+    sqlContent.includes("IF v_inserted_payment_id IS NULL THEN") &&
+    sqlContent.includes("SELECT * INTO v_existing_payment") &&
+    sqlContent.includes("WHERE transaction_id = p_payment_id") &&
+    sqlContent.includes("FOR UPDATE;") &&
+    sqlContent.includes("IF v_existing_payment.order_id != p_order_id THEN") &&
+    sqlContent.includes("RAISE EXCEPTION 'Payment transaction conflict: Transaction % already claimed by order %"),
+    "8.39: fulfill_order_payment resolves concurrent races on unseen transaction IDs via ON CONFLICT RETURNING and post-conflict locking verification"
   );
 
   // ---------------------------------------------------------------------------
