@@ -1522,6 +1522,49 @@ export class InMemoryRepository implements DatabaseRepository {
     }
   }
 
+  // Simulated question row locks modeling PostgreSQL FOR SHARE question locks
+  private questionLocks = new Map<string, { mode: "share" | "update"; count: number; waiters: Array<() => void> }>();
+
+  async acquireQuestionLock(questionId: string, mode: "share" | "update"): Promise<() => void> {
+    while (true) {
+      const current = this.questionLocks.get(questionId);
+      if (!current || current.count <= 0) {
+        const existingWaiters = current ? current.waiters : [];
+        const entry = { mode, count: 1, waiters: existingWaiters };
+        this.questionLocks.set(questionId, entry);
+
+        return () => {
+          entry.count--;
+          if (entry.count <= 0) {
+            if (entry.waiters.length > 0) {
+              const next = entry.waiters.shift();
+              if (next) next();
+            } else {
+              this.questionLocks.delete(questionId);
+            }
+          }
+        };
+      }
+
+      if (current.mode === "share" && mode === "share" && current.waiters.length === 0) {
+        current.count++;
+        return () => {
+          current.count--;
+          if (current.count <= 0) {
+            if (current.waiters.length > 0) {
+              const next = current.waiters.shift();
+              if (next) next();
+            } else {
+              this.questionLocks.delete(questionId);
+            }
+          }
+        };
+      }
+
+      await new Promise<void>((resolve) => current.waiters.push(resolve));
+    }
+  }
+
   async updateQuestionConcurrent(questionId: string, updates: { questionText?: string; versionId?: string }) {
     const q = this.questions.get(questionId);
     if (!q) throw new Error(`Question ${questionId} not found`);
@@ -1539,12 +1582,49 @@ export class InMemoryRepository implements DatabaseRepository {
     if (!opt) throw new Error(`Answer option ${optId} not found`);
     const q = this.questions.get(opt.questionId);
     if (!q) throw new Error(`Question ${opt.questionId} not found`);
-    const releaseLock = await this.acquireVersionLock(q.versionId, "share");
+    const releaseQLock = await this.acquireQuestionLock(q.id, "share");
+    const releaseVLock = await this.acquireVersionLock(q.versionId, "share");
     try {
       await new Promise((r) => setTimeout(r, 15));
       return this.updateAnswerOption(optId, updates);
     } finally {
-      releaseLock();
+      releaseVLock();
+      releaseQLock();
+    }
+  }
+
+  async reparentAnswerOptionConcurrent(optId: string, newQuestionId: string) {
+    const opt = this.answerOptions.get(optId);
+    if (!opt) throw new Error(`Answer option ${optId} not found`);
+    const qOld = this.questions.get(opt.questionId);
+    if (!qOld) throw new Error(`Question ${opt.questionId} not found`);
+    const qNew = this.questions.get(newQuestionId);
+    if (!qNew) throw new Error(`Question ${newQuestionId} not found`);
+
+    // Acquire question locks in deterministic ascending UUID order
+    const [firstQId, secondQId] = qOld.id < qNew.id ? [qOld.id, qNew.id] : [qNew.id, qOld.id];
+    const releaseQ1 = await this.acquireQuestionLock(firstQId, "share");
+    const releaseQ2 = await this.acquireQuestionLock(secondQId, "share");
+
+    // Acquire version locks in deterministic ascending UUID order
+    let releaseV1: (() => void) | undefined;
+    let releaseV2: (() => void) | undefined;
+    if (qOld.versionId === qNew.versionId) {
+      releaseV1 = await this.acquireVersionLock(qOld.versionId, "share");
+    } else {
+      const [firstVId, secondVId] = qOld.versionId < qNew.versionId ? [qOld.versionId, qNew.versionId] : [qNew.versionId, qOld.versionId];
+      releaseV1 = await this.acquireVersionLock(firstVId, "share");
+      releaseV2 = await this.acquireVersionLock(secondVId, "share");
+    }
+
+    try {
+      await new Promise((r) => setTimeout(r, 15));
+      return this.updateAnswerOption(optId, { questionId: newQuestionId });
+    } finally {
+      if (releaseV2) releaseV2();
+      if (releaseV1) releaseV1();
+      releaseQ2();
+      releaseQ1();
     }
   }
 

@@ -264,33 +264,60 @@ DECLARE
     v_old_status TEXT;
     v_new_status TEXT;
 BEGIN
-    -- 1. Identify OLD parent version (for UPDATE and DELETE)
-    IF TG_OP IN ('UPDATE', 'DELETE') THEN
-        IF TG_TABLE_NAME = 'scoring_dimensions' THEN
-            v_old_version_id := OLD.version_id;
-        ELSIF TG_TABLE_NAME = 'questions' THEN
-            v_old_version_id := OLD.version_id;
-        ELSIF TG_TABLE_NAME = 'answer_options' THEN
-            -- Acquire FOR SHARE lock on parent question to serialize against concurrent question modifications
+    -- 1. Identify parent versions and acquire parent locks
+    -- For answer_options: Lock parent question(s) FOR SHARE to serialize against concurrent question modifications.
+    -- When reparenting between two distinct questions, acquire question locks in ascending UUID order to prevent deadlocks.
+    IF TG_TABLE_NAME = 'answer_options' THEN
+        IF TG_OP = 'DELETE' THEN
             SELECT q.version_id INTO v_old_version_id
             FROM public.questions q
             WHERE q.id = OLD.question_id
             FOR SHARE;
-        END IF;
-    END IF;
-
-    -- 2. Identify NEW parent version (for INSERT and UPDATE)
-    IF TG_OP IN ('INSERT', 'UPDATE') THEN
-        IF TG_TABLE_NAME = 'scoring_dimensions' THEN
-            v_new_version_id := NEW.version_id;
-        ELSIF TG_TABLE_NAME = 'questions' THEN
-            v_new_version_id := NEW.version_id;
-        ELSIF TG_TABLE_NAME = 'answer_options' THEN
-            -- Acquire FOR SHARE lock on parent question to serialize against concurrent question modifications
+        ELSIF TG_OP = 'INSERT' THEN
             SELECT q.version_id INTO v_new_version_id
             FROM public.questions q
             WHERE q.id = NEW.question_id
             FOR SHARE;
+        ELSIF TG_OP = 'UPDATE' THEN
+            IF OLD.question_id = NEW.question_id THEN
+                -- In-place update within same question: acquire single question lock
+                SELECT q.version_id INTO v_old_version_id
+                FROM public.questions q
+                WHERE q.id = OLD.question_id
+                FOR SHARE;
+                v_new_version_id := v_old_version_id;
+            ELSE
+                -- Reparenting between two questions: acquire question locks in deterministic ascending UUID order
+                IF OLD.question_id < NEW.question_id THEN
+                    SELECT q.version_id INTO v_old_version_id
+                    FROM public.questions q
+                    WHERE q.id = OLD.question_id
+                    FOR SHARE;
+
+                    SELECT q.version_id INTO v_new_version_id
+                    FROM public.questions q
+                    WHERE q.id = NEW.question_id
+                    FOR SHARE;
+                ELSE
+                    SELECT q.version_id INTO v_new_version_id
+                    FROM public.questions q
+                    WHERE q.id = NEW.question_id
+                    FOR SHARE;
+
+                    SELECT q.version_id INTO v_old_version_id
+                    FROM public.questions q
+                    WHERE q.id = OLD.question_id
+                    FOR SHARE;
+                END IF;
+            END IF;
+        END IF;
+    ELSE
+        -- For scoring_dimensions and questions: parent version_id is directly on the row
+        IF TG_OP IN ('UPDATE', 'DELETE') THEN
+            v_old_version_id := OLD.version_id;
+        END IF;
+        IF TG_OP IN ('INSERT', 'UPDATE') THEN
+            v_new_version_id := NEW.version_id;
         END IF;
     END IF;
 

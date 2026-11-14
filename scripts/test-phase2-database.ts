@@ -979,6 +979,52 @@ async function runPhase2DatabaseTests() {
   const updatedNormalQ = memRepo.updateQuestion(qConc5.id, { questionText: "Draft question successfully edited" });
   assert(updatedNormalQ.questionText === "Draft question successfully edited", "7.49: Normal draft editing succeeds cleanly without publication conflict");
 
+  // Concurrency Scenario 6: Opposite-direction answer-option reparenting (Question A <-> Question B)
+  // Simulates deterministic question lock ordering preventing deadlocks during cross-reparenting
+  const verConc6 = memRepo.createAssessmentVersion({
+    assessmentId: "asm_career_200",
+    versionNumber: 8,
+    status: "draft",
+    changelog: "Career v8 for opposite reparenting deadlock test",
+  });
+  const qConc6A = memRepo.createQuestion({
+    versionId: verConc6.id,
+    questionCode: "car_conc_q6a",
+    questionText: "Question 6A",
+  });
+  const qConc6B = memRepo.createQuestion({
+    versionId: verConc6.id,
+    questionCode: "car_conc_q6b",
+    questionText: "Question 6B",
+  });
+  const optConc6A = memRepo.createAnswerOption({
+    questionId: qConc6A.id,
+    orderIndex: 0,
+    label: "Option starting on Question A",
+    value: 1,
+  });
+  const optConc6B = memRepo.createAnswerOption({
+    questionId: qConc6B.id,
+    orderIndex: 0,
+    label: "Option starting on Question B",
+    value: 2,
+  });
+
+  // Concurrently reparent Option A -> Question B and Option B -> Question A
+  const [reparentOptARes, reparentOptBRes] = await Promise.allSettled([
+    memRepo.reparentAnswerOptionConcurrent(optConc6A.id, qConc6B.id),
+    memRepo.reparentAnswerOptionConcurrent(optConc6B.id, qConc6A.id),
+  ]);
+
+  assert(
+    reparentOptARes.status === "fulfilled" && reparentOptBRes.status === "fulfilled",
+    "7.50: Concurrent opposite-direction answer-option reparenting (A->B and B->A) succeeds without deadlock"
+  );
+  assert(
+    optConc6A.questionId === qConc6B.id && optConc6B.questionId === qConc6A.id,
+    "7.51: Final parent questions for Option A and Option B correctly swapped under deterministic locking"
+  );
+
   // ---------------------------------------------------------------------------
   // 8. SQL MIGRATION SECURITY & CONTRACT VERIFICATION
   // ---------------------------------------------------------------------------
@@ -1293,17 +1339,18 @@ async function runPhase2DatabaseTests() {
     "8.41: enforce_assessment_content_immutability acquires dual parent locks in deterministic ascending UUID order to prevent deadlocks"
   );
 
-  // 8.17 Answer Option Parent Question Lock
+  // 8.17 Answer Option Deterministic Parent Question Lock
   assert(
+    sqlContent.includes("IF OLD.question_id = NEW.question_id THEN") &&
     sqlContent.includes("SELECT q.version_id INTO v_old_version_id") &&
-    sqlContent.includes("FROM public.questions q") &&
     sqlContent.includes("WHERE q.id = OLD.question_id") &&
     sqlContent.includes("FOR SHARE;") &&
-    sqlContent.includes("SELECT q.version_id INTO v_new_version_id") &&
-    sqlContent.includes("FROM public.questions q") &&
+    sqlContent.includes("IF OLD.question_id < NEW.question_id THEN") &&
+    sqlContent.includes("WHERE q.id = OLD.question_id") &&
+    sqlContent.includes("FOR SHARE;") &&
     sqlContent.includes("WHERE q.id = NEW.question_id") &&
     sqlContent.includes("FOR SHARE;"),
-    "8.42: Answer option immutability locks parent question FOR SHARE before resolving version status"
+    "8.42: Answer option immutability locks parent question(s) FOR SHARE in deterministic ascending UUID order to prevent reparenting deadlocks"
   );
 
   // 8.18 Payment Fulfillment Fail-Closed on Missing/Empty Payment ID
