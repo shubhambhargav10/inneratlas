@@ -415,6 +415,19 @@ export function InnerAtlasReportDocument({
           ))}
         </View>
 
+        <View style={styles.footer} fixed>
+          <Text>Personalized Dossier for {customerName}</Text>
+          <Text render={({ pageNumber, totalPages }) => `Page ${pageNumber} of ${totalPages}`} />
+        </View>
+      </Page>
+
+      {/* PAGE 4: STRENGTHS & SHADOW SIDES */}
+      <Page size="A4" style={styles.page}>
+        <View style={styles.header}>
+          <Text style={styles.headerBrand}>{siteConfig.name} • Strengths & Derailers</Text>
+          <Text style={styles.headerCode}>{reportCode}</Text>
+        </View>
+
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>5. Cognitive Superpowers</Text>
           <Text style={styles.sectionSubtitle}>Your natural competitive advantages when operating in peak flow</Text>
@@ -428,19 +441,6 @@ export function InnerAtlasReportDocument({
           </View>
         </View>
 
-        <View style={styles.footer} fixed>
-          <Text>Personalized Dossier for {customerName}</Text>
-          <Text render={({ pageNumber, totalPages }) => `Page ${pageNumber} of ${totalPages}`} />
-        </View>
-      </Page>
-
-      {/* PAGE 4: SHADOW SIDES & INTERPERSONAL DYNAMICS */}
-      <Page size="A4" style={styles.page}>
-        <View style={styles.header}>
-          <Text style={styles.headerBrand}>{siteConfig.name} • Behavioral Dynamics</Text>
-          <Text style={styles.headerCode}>{reportCode}</Text>
-        </View>
-
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>6. Hidden Blindspots & Derailers</Text>
           <Text style={styles.sectionSubtitle}>Subconscious patterns that emerge during high-stress situations</Text>
@@ -452,6 +452,19 @@ export function InnerAtlasReportDocument({
               </View>
             ))}
           </View>
+        </View>
+
+        <View style={styles.footer} fixed>
+          <Text>Personalized Dossier for {customerName}</Text>
+          <Text render={({ pageNumber, totalPages }) => `Page ${pageNumber} of ${totalPages}`} />
+        </View>
+      </Page>
+
+      {/* PAGE 5: INTERPERSONAL DYNAMICS */}
+      <Page size="A4" style={styles.page}>
+        <View style={styles.header}>
+          <Text style={styles.headerBrand}>{siteConfig.name} • Behavioral Dynamics</Text>
+          <Text style={styles.headerCode}>{reportCode}</Text>
         </View>
 
         <View style={styles.section}>
@@ -476,7 +489,7 @@ export function InnerAtlasReportDocument({
         </View>
       </Page>
 
-      {/* PAGE 5: 90-DAY ACTION ROADMAP & METHODOLOGY */}
+      {/* PAGE 6: 90-DAY ACTION ROADMAP & METHODOLOGY */}
       <Page size="A4" style={styles.page}>
         <View style={styles.header}>
           <Text style={styles.headerBrand}>{siteConfig.name} • Strategic Roadmap</Text>

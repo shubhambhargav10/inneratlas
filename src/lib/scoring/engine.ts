@@ -181,8 +181,8 @@ export function calculateAssessmentResult({
       ...primaryArchetype.blindspots.slice(0, 3),
       ...(secondaryArchetype ? [secondaryArchetype.blindspots[0]] : []),
     ],
-    communicationGuidance: `${primaryArchetype.communicationStyle} When collaborating with differing perspectives, anchor your message by bridging your core focus on ${primaryArchetype.title.toLowerCase()} priorities with clear mutual goals.`,
-    collaborationDynamics: `${primaryArchetype.collaborationStyle} You reach maximum effectiveness when working alongside partners who complement your natural rhythm.`,
+    communicationGuidance: `${primaryArchetype.communicationStyle} When collaborating with differing perspectives, anchor your communication in the shared goal rather than your preferred style — this is where ${primaryArchetype.title} energy becomes a genuine bridge rather than a barrier.`,
+    collaborationDynamics: `${primaryArchetype.collaborationStyle} You reach maximum effectiveness when working alongside partners who complement your natural strengths and constructively challenge your blind spots.`,
     careerEnvironmentRecommendation: primaryArchetype.idealEnvironment,
     actionPlan90Days: {
       phase1: {
@@ -191,7 +191,7 @@ export function calculateAssessmentResult({
         actions: [
           `Audit your past 30 days of decisions against your primary blindspot: ${primaryArchetype.blindspots[0].toLowerCase()}`,
           `Implement a 15-minute daily reflection ritual to observe when you default to overusing your natural strengths.`,
-          `Communicate your preferred working and feedback style (${primaryArchetype.communicationStyle.slice(0, 80)}...) to close collaborators.`,
+          `Share your natural communication approach — ${primaryArchetype.communicationStyle.replace(/\.$/, "").toLowerCase()} — with your closest collaborators so they know how to work with you at your best.`,
         ],
       },
       phase2: {
