@@ -44,16 +44,21 @@ export async function POST(req: NextRequest) {
 
     const event = JSON.parse(rawBody);
     const eventType = event.event;
-    const eventId = event.id || req.headers.get("x-razorpay-event-id");
+    const rawEventId = event.id || req.headers.get("x-razorpay-event-id");
+
+    // Require valid event identifier for deduplication and audit trail
+    if (!rawEventId || typeof rawEventId !== "string" || !rawEventId.trim()) {
+      return NextResponse.json({ error: "Missing or invalid event identifier" }, { status: 400 });
+    }
+
+    const eventId = rawEventId.trim();
 
     // 1. Webhook Event Deduplication & Concurrency-Safe Lifecycle Transition
-    if (eventId) {
-      const lifecycle = await db.recordWebhookLifecycle(eventId, eventType, event);
-      if (!lifecycle.shouldProcess) {
-        console.log(`[Webhook] Event ${eventId} (status: ${lifecycle.status}) skipped.`);
-        const responseStatus = lifecycle.status === "processed" ? "already_processed" : lifecycle.status;
-        return NextResponse.json({ status: responseStatus, eventId });
-      }
+    const lifecycle = await db.recordWebhookLifecycle(eventId, eventType, event);
+    if (!lifecycle.shouldProcess) {
+      console.log(`[Webhook] Event ${eventId} (status: ${lifecycle.status}) skipped.`);
+      const responseStatus = lifecycle.status === "processed" ? "already_processed" : lifecycle.status;
+      return NextResponse.json({ status: responseStatus, eventId });
     }
 
     const paymentEntity = event.payload?.payment?.entity;

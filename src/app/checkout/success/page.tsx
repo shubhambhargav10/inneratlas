@@ -49,7 +49,7 @@ export default async function CheckoutSuccessPage({ searchParams }: SuccessPageP
           Your Comprehensive Dossier is Ready
         </h1>
         <p className="text-sm sm:text-base text-ink-muted max-w-lg mx-auto mb-8">
-          Thank you, <strong>{order?.customerName || "Friend"}</strong>. Your payment was verified successfully and your personalized 12-page PDF dossier has been generated.
+          Thank you, <strong>{order?.customerName || "Friend"}</strong>. Your payment was verified successfully and your personalized six-page PDF dossier has been generated.
         </p>
 
         {/* Order Details Badge */}

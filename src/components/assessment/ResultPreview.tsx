@@ -287,14 +287,14 @@ export function ResultPreview({ assessment, result, guestSessionToken }: ResultP
           <div className="w-full max-w-xl rounded-3xl bg-white/95 backdrop-blur-xl border border-brand-200/80 p-6 sm:p-8 shadow-lifted text-center ring-1 ring-brand-500/20">
             <div className="inline-flex items-center space-x-1.5 px-3 py-1 rounded-full bg-accent-gold/10 text-accent-gold text-xs font-bold uppercase tracking-wider mb-3">
               <Flame className="w-3.5 h-3.5 text-accent-gold" />
-              <span>Full 12-Page Dossier Available</span>
+              <span>Full Six-Page Dossier Available</span>
             </div>
 
             <h3 className="text-2xl sm:text-3xl font-serif text-ink font-semibold tracking-tight mb-2">
               Unlock Your Complete Dossier
             </h3>
             <p className="text-xs sm:text-sm text-ink-muted max-w-md mx-auto mb-6">
-              Get immediate access to your full 12-page printable PDF report, including your secondary archetype blend, hidden shadow traits, and custom 90-day action plan.
+              Get immediate access to your full six-page printable PDF report, including your secondary archetype blend, hidden shadow traits, and custom 90-day action plan.
             </p>
 
             {/* Price Anchor */}

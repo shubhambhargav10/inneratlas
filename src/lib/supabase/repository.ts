@@ -180,10 +180,16 @@ export class SupabasePostgresRepository implements DatabaseRepository {
         updated_at: now,
       })
       .eq("id", orderId)
+      .neq("status", "paid") // Guard: never downgrade a fulfilled paid order
       .select()
       .single();
 
     if (error || !data) {
+      // If no row was updated, the order is already paid — return it unchanged
+      const existing = await this.getOrderById(orderId);
+      if (existing && existing.status === "paid") {
+        return existing;
+      }
       throw new Error(`Failed to update order status to failed: ${error?.message}`);
     }
 
@@ -980,6 +986,10 @@ export class InMemoryRepository implements DatabaseRepository {
   async markOrderAsFailed(orderId: string): Promise<OrderRecord> {
     const order = this.orders.get(orderId);
     if (!order) throw new Error(`Order ${orderId} not found`);
+    // Guard: never downgrade a fulfilled paid order
+    if (order.status === "paid") {
+      return order;
+    }
     order.status = "failed";
     order.updatedAt = new Date().toISOString();
     return order;

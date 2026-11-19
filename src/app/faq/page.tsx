@@ -12,11 +12,11 @@ export default function FAQPage() {
   const faqs = [
     {
       q: "What makes INNERATLAS different from other online personality tests?",
-      a: "Most online quizzes force you into rigid binary categories or shallow 4-letter labels. INNERATLAS measures four to six calibrated psychometric spectrums to identify both your Primary Archetype and your Secondary Balance (e.g. The Strategic Creator). The resulting reports are 10–12 page executive dossiers with concrete, nuanced growth roadmaps.",
+      a: "Most online quizzes force you into rigid binary categories or shallow 4-letter labels. INNERATLAS measures four to six calibrated psychometric spectrums to identify both your Primary Archetype and your Secondary Balance (e.g. The Strategic Creator). The resulting reports are detailed six-page executive dossiers with concrete, nuanced growth roadmaps.",
     },
     {
       q: "Are the assessments really free?",
-      a: "Yes. All three assessments (Personality Archetype, Career DNA, and Thinking Styles) can be taken completely free of charge. You immediately receive a free executive preview showing your primary archetype, dimensional distribution, and superpowers. The full 12-page in-depth PDF report is available for an optional one-time fee of ₹199.",
+      a: "Yes. All three assessments (Personality Archetype, Career DNA, and Thinking Styles) can be taken completely free of charge. You immediately receive a free executive preview showing your primary archetype, dimensional distribution, and superpowers. The full six-page in-depth PDF report is available for an optional one-time fee of ₹199.",
     },
     {
       q: "How does the PDF report get delivered?",

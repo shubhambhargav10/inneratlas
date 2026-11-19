@@ -39,7 +39,7 @@ export default function HomePage() {
 
             {/* Sub-headline */}
             <p className="text-lg sm:text-xl text-ink-muted leading-relaxed font-normal mb-10 max-w-2xl mx-auto">
-              Move beyond simplistic 4-letter boxes. Take our calibrated self-discovery assessments for free, and unlock a deeply personalized 12-page executive PDF dossier designed for personal and professional mastery.
+              Move beyond simplistic 4-letter boxes. Take our calibrated self-discovery assessments for free, and unlock a deeply personalized six-page executive PDF dossier designed for personal and professional mastery.
             </p>
 
             {/* CTAs */}
@@ -207,7 +207,7 @@ export default function HomePage() {
             {/* Step 4 */}
             <div className="rounded-3xl border border-[#E8E2D9] bg-white p-6 shadow-soft relative">
               <span className="font-serif text-4xl text-brand-200 font-bold block mb-3">04</span>
-              <h3 className="text-base font-semibold text-ink mb-2">Unlock 12-Page Dossier</h3>
+              <h3 className="text-base font-semibold text-ink mb-2">Unlock Six-Page Dossier</h3>
               <p className="text-xs text-ink-muted leading-relaxed">
                 Purchase your complete, high-resolution printable PDF dossier with secondary blend analysis and 90-day action plan for ₹199.
               </p>
@@ -227,7 +227,7 @@ export default function HomePage() {
               A True Digital Product, Not a Generic Template
             </h2>
             <p className="text-sm sm:text-base text-ink-muted">
-              Every dossier is generated directly from your specific answer distribution. Here is what is included inside the 12-page executive PDF:
+              Every dossier is generated directly from your specific answer distribution. Here is what is included inside the six-page executive PDF:
             </p>
           </div>
 
@@ -303,7 +303,7 @@ export default function HomePage() {
             {[
               {
                 q: "Is this assessment free to take?",
-                a: "Yes. All three assessments are 100% free to complete. Upon completion, you immediately receive a free executive results preview revealing your primary archetype and dimensional scores. You can optionally purchase the full 12-page in-depth PDF dossier for ₹199.",
+                a: "Yes. All three assessments are 100% free to complete. Upon completion, you immediately receive a free executive results preview revealing your primary archetype and dimensional scores. You can optionally purchase the full six-page in-depth PDF dossier for ₹199.",
               },
               {
                 q: "Do I need to create an account before taking an assessment?",
