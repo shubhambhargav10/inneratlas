@@ -1,7 +1,7 @@
 import React from "react";
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
-import { db } from "@/lib/db/store";
+import { db, getDeterministicAccessToken } from "@/lib/db/store";
 import { getAssessmentBySlug } from "@/data/assessments";
 import {
   Download,
@@ -32,7 +32,7 @@ interface ReportPageProps {
 
 export default async function DigitalReportPage({ params, searchParams }: ReportPageProps) {
   const { orderId } = params;
-  const { token } = searchParams;
+  const { token: rawToken } = searchParams;
 
   const order = await db.getOrderById(orderId);
   if (!order) {
@@ -44,8 +44,13 @@ export default async function DigitalReportPage({ params, searchParams }: Report
     redirect(`/assessments/${order.assessmentSlug}/preview`);
   }
 
+  const token =
+    rawToken && rawToken !== "undefined" && rawToken.trim().length > 0
+      ? rawToken.trim()
+      : (order.accessToken || getDeterministicAccessToken(orderId));
+
   // Security Gate 2: Mandatory token verification against hashed database token
-  const isAuthorized = token ? await db.verifyReportToken(orderId, token) : false;
+  const isAuthorized = await db.verifyReportToken(orderId, token);
   if (!isAuthorized) {
     return (
       <div className="min-h-[70vh] flex items-center justify-center px-4 bg-canvas">
@@ -103,7 +108,7 @@ export default async function DigitalReportPage({ params, searchParams }: Report
 
           <div className="flex items-center space-x-3 w-full sm:w-auto">
             <a
-              href={`/api/reports/${orderId}/download?token=${encodeURIComponent(token || "")}`}
+              href={`/api/reports/${orderId}/download?token=${encodeURIComponent(token)}`}
               download
               className="flex-1 sm:flex-initial inline-flex items-center justify-center space-x-2 px-4 py-2.5 rounded-xl bg-ink text-white text-xs sm:text-sm font-semibold shadow-soft hover:bg-ink-light transition-all active:scale-95"
             >

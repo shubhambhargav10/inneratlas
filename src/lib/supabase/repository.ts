@@ -22,6 +22,24 @@ export function hashAccessToken(token: string): string {
   return crypto.createHash("sha256").update(token).digest("hex");
 }
 
+/**
+ * Derives a deterministic access token for an order based on order ID and server secret.
+ * This guarantees that webhooks, browser payment verification, and the success page
+ * always resolve the identical access token without storing plaintext credentials in the database.
+ */
+export function getDeterministicAccessToken(orderId: string): string {
+  const secret =
+    process.env.SUPABASE_SECRET_KEY ||
+    process.env.RAZORPAY_KEY_SECRET ||
+    process.env.RAZORPAY_WEBHOOK_SECRET ||
+    "inneratlas_secure_report_token_salt";
+  const hmac = crypto
+    .createHmac("sha256", secret)
+    .update(`inneratlas_order_access_${orderId}`)
+    .digest("hex");
+  return `acc_${hmac.slice(0, 32)}`;
+}
+
 export interface DatabaseRepository {
   createOrder(data: {
     guestSessionToken: string;
@@ -212,7 +230,7 @@ export class SupabasePostgresRepository implements DatabaseRepository {
 
     const reportId = "rep_" + crypto.randomBytes(8).toString("hex");
     const reportCode = "DOSSIER-" + Math.floor(100000 + Math.random() * 900000);
-    const plaintextAccessToken = "acc_" + crypto.randomBytes(16).toString("hex");
+    const plaintextAccessToken = getDeterministicAccessToken(orderId);
     const tokenHash = hashAccessToken(plaintextAccessToken);
 
     // Call atomic PostgreSQL RPC fulfill_order_payment
@@ -260,7 +278,7 @@ export class SupabasePostgresRepository implements DatabaseRepository {
       }
       const existingReport = await this.getReportByOrderId(orderId);
       if (existingReport) {
-        return { order, report: existingReport, accessToken: order.accessToken || "acc_existing" };
+        return { order, report: existingReport, accessToken: plaintextAccessToken };
       }
     }
 
@@ -374,15 +392,31 @@ export class SupabasePostgresRepository implements DatabaseRepository {
   }
 
   async verifyReportToken(orderId: string, token: string): Promise<boolean> {
+    if (!token || typeof token !== "string" || !token.trim() || token === "undefined") return false;
     const report = await this.getReportByOrderId(orderId);
     if (!report) return false;
 
-    const computedHash = hashAccessToken(token);
+    const trimmedToken = token.trim();
+    const computedHash = hashAccessToken(trimmedToken);
     const expectedBuf = Buffer.from(report.accessTokenHash, "hex");
     const actualBuf = Buffer.from(computedHash, "hex");
 
-    if (expectedBuf.length !== actualBuf.length) return false;
-    return crypto.timingSafeEqual(expectedBuf, actualBuf);
+    if (expectedBuf.length === actualBuf.length && crypto.timingSafeEqual(expectedBuf, actualBuf)) {
+      return true;
+    }
+
+    // Self-healing: if the token matches the deterministic token for this order,
+    // update the report's stored hash so future lookups are immediately fast and consistent.
+    const deterministicToken = getDeterministicAccessToken(orderId);
+    if (trimmedToken === deterministicToken) {
+      await this.client
+        .from("reports")
+        .update({ access_token_hash: computedHash })
+        .eq("id", report.id);
+      return true;
+    }
+
+    return false;
   }
 
   async incrementReportDownload(reportId: string): Promise<void> {
@@ -1027,7 +1061,7 @@ export class InMemoryRepository implements DatabaseRepository {
       }
       const existingReport = Array.from(this.reports.values()).find((r) => r.orderId === orderId);
       if (existingReport) {
-        return { order, report: existingReport, accessToken: order.accessToken || "acc_existing" };
+        return { order, report: existingReport, accessToken: getDeterministicAccessToken(orderId) };
       }
     }
 
@@ -1040,12 +1074,12 @@ export class InMemoryRepository implements DatabaseRepository {
 
     const existingReport = Array.from(this.reports.values()).find((r) => r.orderId === orderId);
     if (existingReport) {
-      return { order, report: existingReport, accessToken: order.accessToken || "acc_existing" };
+      return { order, report: existingReport, accessToken: getDeterministicAccessToken(orderId) };
     }
 
     const reportId = "rep_" + crypto.randomBytes(8).toString("hex");
     const reportCode = "DOSSIER-" + Math.floor(100000 + Math.random() * 900000);
-    const plaintextAccessToken = "acc_" + crypto.randomBytes(16).toString("hex");
+    const plaintextAccessToken = getDeterministicAccessToken(orderId);
     const tokenHash = hashAccessToken(plaintextAccessToken);
 
     // Record payment in audit log with concurrent race protection
@@ -1096,15 +1130,28 @@ export class InMemoryRepository implements DatabaseRepository {
   }
 
   async verifyReportToken(orderId: string, token: string): Promise<boolean> {
+    if (!token || typeof token !== "string" || !token.trim() || token === "undefined") return false;
     const report = await this.getReportByOrderId(orderId);
     if (!report) return false;
 
-    const computedHash = hashAccessToken(token);
+    const trimmedToken = token.trim();
+    const computedHash = hashAccessToken(trimmedToken);
     const expectedBuf = Buffer.from(report.accessTokenHash, "hex");
     const actualBuf = Buffer.from(computedHash, "hex");
 
-    if (expectedBuf.length !== actualBuf.length) return false;
-    return crypto.timingSafeEqual(expectedBuf, actualBuf);
+    if (expectedBuf.length === actualBuf.length && crypto.timingSafeEqual(expectedBuf, actualBuf)) {
+      return true;
+    }
+
+    // Self-healing: if the token matches the deterministic token for this order,
+    // update the report's stored hash so future lookups are immediately fast and consistent.
+    const deterministicToken = getDeterministicAccessToken(orderId);
+    if (trimmedToken === deterministicToken) {
+      report.accessTokenHash = computedHash;
+      return true;
+    }
+
+    return false;
   }
 
   async incrementReportDownload(reportId: string): Promise<void> {

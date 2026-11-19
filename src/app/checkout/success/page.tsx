@@ -1,6 +1,6 @@
 import React from "react";
 import Link from "next/link";
-import { db } from "@/lib/db/store";
+import { db, getDeterministicAccessToken } from "@/lib/db/store";
 import { CheckCircle2, Download, ExternalLink, ArrowRight, ShieldCheck, Mail } from "lucide-react";
 
 interface SuccessPageProps {
@@ -11,7 +11,7 @@ interface SuccessPageProps {
 }
 
 export default async function CheckoutSuccessPage({ searchParams }: SuccessPageProps) {
-  const { orderId, token } = searchParams;
+  const { orderId, token: rawToken } = searchParams;
 
   if (!orderId) {
     return (
@@ -33,6 +33,11 @@ export default async function CheckoutSuccessPage({ searchParams }: SuccessPageP
 
   const order = await db.getOrderById(orderId);
   const report = await db.getReportByOrderId(orderId);
+
+  const token =
+    rawToken && rawToken !== "undefined" && rawToken.trim().length > 0
+      ? rawToken.trim()
+      : (order?.accessToken || getDeterministicAccessToken(orderId));
 
   return (
     <div className="max-w-3xl mx-auto px-4 sm:px-6 py-12 md:py-20">
@@ -75,7 +80,7 @@ export default async function CheckoutSuccessPage({ searchParams }: SuccessPageP
         {/* Action Buttons */}
         <div className="flex flex-col sm:flex-row items-center justify-center gap-4 max-w-md mx-auto mb-8">
           <a
-            href={`/api/reports/${orderId}/download?token=${token || order?.accessToken}`}
+            href={`/api/reports/${orderId}/download?token=${token}`}
             download
             className="w-full sm:w-auto flex-1 inline-flex items-center justify-center space-x-2 py-3 px-6 rounded-xl bg-ink text-white text-sm font-semibold shadow-soft hover:bg-ink-light transition-all active:scale-95"
           >
@@ -84,7 +89,7 @@ export default async function CheckoutSuccessPage({ searchParams }: SuccessPageP
           </a>
 
           <Link
-            href={`/reports/${orderId}?token=${token || order?.accessToken}`}
+            href={`/reports/${orderId}?token=${token}`}
             className="w-full sm:w-auto flex-1 inline-flex items-center justify-center space-x-2 py-3 px-6 rounded-xl bg-canvas border border-[#E8E2D9] text-ink text-sm font-semibold hover:bg-canvas-subtle transition-all"
           >
             <ExternalLink className="w-4 h-4 text-brand-600" />

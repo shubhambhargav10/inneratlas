@@ -14,7 +14,7 @@ export async function GET(
     const token = searchParams.get("token");
 
     // 1. Mandatory access token validation (fail closed if missing)
-    if (!token || typeof token !== "string" || token.trim().length === 0) {
+    if (!token || typeof token !== "string" || token.trim().length === 0 || token === "undefined") {
       return new NextResponse("Unauthorized: Access token is strictly required to download report.", {
         status: 401,
         headers: {

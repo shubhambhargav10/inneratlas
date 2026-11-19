@@ -3,6 +3,7 @@ import {
   SupabasePostgresRepository,
   InMemoryRepository,
   hashAccessToken,
+  getDeterministicAccessToken,
 } from "@/lib/supabase/repository";
 import { isSupabaseConfigured } from "@/lib/supabase/config";
 import {
@@ -16,7 +17,7 @@ import {
 import { AssessmentResult } from "@/data/assessments/types";
 
 export type { OrderRecord, ReportRecord, OrderStatus, AssessmentSessionRecord, ProfileRecord, ProfileRole };
-export { hashAccessToken };
+export { hashAccessToken, getDeterministicAccessToken };
 
 let postgresRepoInstance: SupabasePostgresRepository | null = null;
 let inMemoryRepoInstance: InMemoryRepository | null = null;

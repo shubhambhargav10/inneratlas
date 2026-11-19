@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db } from "@/lib/db/store";
+import { db, getDeterministicAccessToken } from "@/lib/db/store";
 import crypto from "crypto";
 
 export async function POST(req: NextRequest) {
@@ -36,7 +36,7 @@ export async function POST(req: NextRequest) {
         success: true,
         alreadyProcessed: true,
         orderId: order.id,
-        accessToken: order.accessToken,
+        accessToken: order.accessToken || getDeterministicAccessToken(order.id),
         reportCode: existingReport?.reportCode || order.reportCode,
       });
     }
